@@ -1,0 +1,15 @@
+# Core
+pyqt5==5.15.9
+pyqt5-tools==5.15.9
+
+# AI and Machine Learning
+numpy==1.24.3
+cryptography==41.0.7
+
+# Database (built-in, no need)
+
+# Excel Export
+openpyxl==3.1.2
+
+# Additional
+requests==2.31.0
