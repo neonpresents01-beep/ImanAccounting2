@@ -28,6 +28,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install pyinstaller==5.13.2
           python -m pip install PyQt5==5.15.9
+          python -m pip install PyQtChart==5.15.6
           python -m pip install persiantools==4.0.0
           python -m pip install reportlab==3.6.13
           python -m pip install bcrypt==4.0.1
@@ -37,11 +38,11 @@ jobs:
           python -m pip install pillow==9.5.0
           python -m pip install requests==2.31.0
       
-      - name: 🏗️ Build OneFile with PyInstaller
+      - name: 🏗️ Build OneFile
         run: |
-          python -m PyInstaller --onefile --windowed --icon=Icon.ico --name=ImanAccount --add-data="fonts;fonts" --add-data="Icon.ico;." --hidden-import=PyQt5.QtPrintSupport --hidden-import=PyQt5.QtChart --hidden-import=persiantools --hidden-import=reportlab --hidden-import=bcrypt --hidden-import=arabic_reshaper --hidden-import=bidi --hidden-import=cryptography --hidden-import=cryptography.hazmat --hidden-import=cryptography.hazmat.backends --hidden-import=cryptography.hazmat.backends.openssl --hidden-import=PIL --hidden-import=requests --hidden-import=license_core --hidden-import=registry_guard --hidden-import=database --hidden-import=security --noupx --clean --noconfirm main2.py
+          python -m PyInstaller --onefile --windowed --icon=Icon.ico --name=ImanAccount --add-data="fonts;fonts" --add-data="Icon.ico;." --collect-all PyQt5 --collect-all PyQtChart --hidden-import=PyQt5.QtPrintSupport --hidden-import=PyQt5.QtChart --hidden-import=PyQt5.QtSvg --hidden-import=PyQt5.QtXml --hidden-import=PyQt5.QtNetwork --hidden-import=PyQt5.sip --hidden-import=persiantools --hidden-import=reportlab --hidden-import=bcrypt --hidden-import=arabic_reshaper --hidden-import=bidi --hidden-import=cryptography --hidden-import=cryptography.hazmat --hidden-import=cryptography.hazmat.backends --hidden-import=cryptography.hazmat.backends.openssl --hidden-import=PIL --hidden-import=requests --hidden-import=license_core --hidden-import=registry_guard --hidden-import=database --hidden-import=security --noupx --clean --noconfirm main2.py
       
-      - name: 📤 Upload OneFile (32-bit)
+      - name: 📤 Upload OneFile
         uses: actions/upload-artifact@v4
         with:
           name: ImanAccount-OneFile-32bit
@@ -51,11 +52,11 @@ jobs:
       - name: 📦 Install Inno Setup
         run: choco install innosetup -y
       
-      - name: 🏗️ Build Installer (32-bit)
+      - name: 🏗️ Build Installer
         run: |
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
       
-      - name: 📤 Upload Installer (32-bit)
+      - name: 📤 Upload Installer
         uses: actions/upload-artifact@v4
         with:
           name: ImanAccount-Installer-32bit
@@ -84,6 +85,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install pyinstaller==5.13.2
           python -m pip install PyQt5==5.15.9
+          python -m pip install PyQtChart==5.15.6
           python -m pip install persiantools==4.0.0
           python -m pip install reportlab==3.6.13
           python -m pip install bcrypt==4.0.1
@@ -93,11 +95,11 @@ jobs:
           python -m pip install pillow==9.5.0
           python -m pip install requests==2.31.0
       
-      - name: 🏗️ Build OneFile with PyInstaller
+      - name: 🏗️ Build OneFile
         run: |
-          python -m PyInstaller --onefile --windowed --icon=Icon.ico --name=ImanAccount --add-data="fonts;fonts" --add-data="Icon.ico;." --hidden-import=PyQt5.QtPrintSupport --hidden-import=PyQt5.QtChart --hidden-import=persiantools --hidden-import=reportlab --hidden-import=bcrypt --hidden-import=arabic_reshaper --hidden-import=bidi --hidden-import=cryptography --hidden-import=cryptography.hazmat --hidden-import=cryptography.hazmat.backends --hidden-import=cryptography.hazmat.backends.openssl --hidden-import=PIL --hidden-import=requests --hidden-import=license_core --hidden-import=registry_guard --hidden-import=database --hidden-import=security --noupx --clean --noconfirm main2.py
+          python -m PyInstaller --onefile --windowed --icon=Icon.ico --name=ImanAccount --add-data="fonts;fonts" --add-data="Icon.ico;." --collect-all PyQt5 --collect-all PyQtChart --hidden-import=PyQt5.QtPrintSupport --hidden-import=PyQt5.QtChart --hidden-import=PyQt5.QtSvg --hidden-import=PyQt5.QtXml --hidden-import=PyQt5.QtNetwork --hidden-import=PyQt5.sip --hidden-import=persiantools --hidden-import=reportlab --hidden-import=bcrypt --hidden-import=arabic_reshaper --hidden-import=bidi --hidden-import=cryptography --hidden-import=cryptography.hazmat --hidden-import=cryptography.hazmat.backends --hidden-import=cryptography.hazmat.backends.openssl --hidden-import=PIL --hidden-import=requests --hidden-import=license_core --hidden-import=registry_guard --hidden-import=database --hidden-import=security --noupx --clean --noconfirm main2.py
       
-      - name: 📤 Upload OneFile (64-bit)
+      - name: 📤 Upload OneFile
         uses: actions/upload-artifact@v4
         with:
           name: ImanAccount-OneFile-64bit
@@ -107,11 +109,11 @@ jobs:
       - name: 📦 Install Inno Setup
         run: choco install innosetup -y
       
-      - name: 🏗️ Build Installer (64-bit)
+      - name: 🏗️ Build Installer
         run: |
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
       
-      - name: 📤 Upload Installer (64-bit)
+      - name: 📤 Upload Installer
         uses: actions/upload-artifact@v4
         with:
           name: ImanAccount-Installer-64bit
