@@ -1,7 +1,7 @@
 ; installer.iss
 ; ============================================================
-; ImanAccount Installer
-; نسخه 1.0.0
+; ImanAccount Installer v2.0
+; English Only (GitHub Actions Compatible)
 ; ============================================================
 
 #define MyAppName "ImanAccount"
@@ -9,7 +9,6 @@
 #define MyAppPublisher "ImanAI"
 #define MyAppURL "https://imanai.ir"
 #define MyAppExeName "ImanAccount.exe"
-#define MySupportPhone "09937060447"
 #define MySupportEmail "support@imanai.ir"
 
 [Setup]
@@ -47,6 +46,8 @@ english.WelcomeLabel1=Welcome to {#MyAppName} Setup
 english.WelcomeLabel2=This will install {#MyAppName} version {#MyAppVersion} on your computer.
 english.CreateDesktopIcon=Create a &desktop shortcut
 english.LaunchApp=Launch ImanAccount
+english.SelectDataDir=Select Data Directory
+english.DataDirDesc=Where should your data (database, logs, backups) be stored?
 
 [Files]
 Source: "dist\ImanAccount\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
@@ -78,8 +79,8 @@ var
 procedure InitializeWizard();
 begin
   DataDirPage := CreateInputDirPage(wpSelectDir,
-    'Select Data Directory',
-    'Where should your data (database, logs, backups) be stored?',
+    ExpandConstant('{cm:SelectDataDir}'),
+    ExpandConstant('{cm:DataDirDesc}'),
     'Default: %APPDATA%\ImanAccount',
     False,
     'New Folder');
@@ -103,26 +104,4 @@ begin
     ForceDirectories(DataDir + '\logs');
     ForceDirectories(DataDir + '\backups');
   end;
-end;
-
-function UpdateReadyMemo(Space, NewLine, MemoUserInfoInfo, MemoDirInfo,
-  MemoTypeInfo, MemoComponentsInfo, MemoGroupInfo, MemoTasksInfo: String): String;
-var
-  S: String;
-begin
-  S := 'Installation Info:' + NewLine;
-  S := S + Space + '- Version: {#MyAppVersion}' + NewLine;
-  S := S + Space + '- Install to: {app}' + NewLine;
-  S := S + NewLine;
-  
-  if DataDirPage.Values[0] <> '' then
-  begin
-    S := S + 'Data Directory:' + NewLine;
-    S := S + Space + '- ' + DataDirPage.Values[0] + NewLine;
-    S := S + NewLine;
-  end;
-  
-  S := S + 'Support: {#MySupportEmail}' + NewLine;
-  
-  Result := S;
 end;
