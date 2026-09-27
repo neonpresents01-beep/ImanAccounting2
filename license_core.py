@@ -1,6 +1,7 @@
 # license_core.py
 # ============================================================
 # سیستم لایسنس ImanAccount - v4.0 (Product-Ready)
+# نسخه بازنویسی‌شده با Embedded Public Key
 # ============================================================
 
 import os
@@ -21,13 +22,43 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.backends import default_backend
 from cryptography.exceptions import InvalidSignature
 
+
+# ============================================================
 # ========== Import Registry Guard ==========
+# ============================================================
+
 try:
     from registry_guard import get_machine_id as _get_machine_id_from_registry
     REGISTRY_AVAILABLE = True
 except ImportError:
     REGISTRY_AVAILABLE = False
     print("⚠️ registry_guard یافت نشد!")
+
+
+# ============================================================
+# ========== Embedded Public Key ==========
+# ============================================================
+# 
+# ⚠️ این کلید عمومی توسط فروشنده از فایل .keys/public_key.pem گرفته شده
+# ⚠️ برای اینکه نرم‌افزار مشتری بتونه لایسنس رو verify کنه
+# ⚠️ این کلید برای همه مشتری‌ها یکسانه
+# 
+# ============================================================
+
+EMBEDDED_PUBLIC_KEY = """-----BEGIN PUBLIC KEY-----
+MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAm75rbyg5jusURqCcO3M1
+OxbG4WQh0ZFDNxf7OR2TvPB4sTmY9Bq+lACUnqrexpuwluVxp+RxeweVAw2Yeg9b
+zX4HPNLg9DO2mRKENLF9nwa0d1GuUZirsoQQ4qnKdPZGx3rPEBOPl25jW9CZTBX2
+4Mh8d4dtCwWImyHuhgHj3VU4+3fSCvTyL2JyPeoph/fZ6Ec2tqn48ynwPAORn3mr
+Zpf4o63/DapaiHuSlqzx0GBRz2srEpXn7Lsn4Q6/OaqX5CXPy0Tp9SjCGIUou2IS
+a0S9h7LRObLK0bwlUh2Tw2p4ldVO6mofsJmt11uDDAGhrueVeDQeBceav5Q/w3rS
+YDSz6Qzqtp5Ttz48XGtvpAo68hmHjBGGzm/ckXrBK8SdpUswF0b9P77RcrM5WLLS
+/qoNUTtT33CLsBK4wGOjU4IBO3BV95QQFHKucMgJmc4nwgGthV+l+ModO4q2ROPa
+aW0JXYr+XQDbXo/P1BvlMvzFesc792mwg1ALoTX6+Z9oX5FSHzpDxLqWAlXfxv/9
+7zK81MJ8v1RQd1lSLt46zTo94I/iHrRo4iB01SNCUEmhe+tIu1lXxS6VixV7oE39
+SefGNAvPLEYAaSJhGhqkINXlIdZYRiIy3KzxrPylcxsVyayGFXEqAlCGn1DQiEX8
+ojRdmrTsuYPxdudMl07A2WUCAwEAAQ==
+-----END PUBLIC KEY-----"""
 
 
 # ============================================================
@@ -112,7 +143,7 @@ class LicenseCore:
       - تولید Trial Certificate
     
     حالت مشتری (is_seller=False):
-      - فقط کلید عمومی
+      - فقط کلید عمومی (embedded)
       - بررسی لایسنس
       - استفاده از Trial Certificate
     """
@@ -155,7 +186,9 @@ class LicenseCore:
             self._generate_seller_keys()
     
     def _init_customer_keys(self):
-        """مشتری: فقط کلید عمومی (از فایل)"""
+        """مشتری: فقط کلید عمومی"""
+        
+        # ۱. تلاش از فایل
         if PUBLIC_KEY_PATH.exists():
             try:
                 with open(PUBLIC_KEY_PATH, 'rb') as f:
@@ -166,35 +199,26 @@ class LicenseCore:
                 self.private_key = None
                 return
             except Exception as e:
-                print(f"⚠️ خطا در بارگذاری کلید عمومی: {e}")
+                print(f"⚠️ خطا در بارگذاری کلید عمومی از فایل: {e}")
         
-        # اگر فایل نبود، از embedded key استفاده کن
-        embedded_key = self._get_embedded_public_key()
-        if embedded_key:
-            try:
-                self.public_key = serialization.load_pem_public_key(
-                    embedded_key.encode('utf-8'),
-                    backend=default_backend()
-                )
-                self.private_key = None
-                return
-            except Exception as e:
-                print(f"⚠️ خطا در بارگذاری embedded key: {e}")
+        # ۲. تلاش از Embedded Key
+        try:
+            self.public_key = serialization.load_pem_public_key(
+                EMBEDDED_PUBLIC_KEY.encode('utf-8'),
+                backend=default_backend()
+            )
+            self.private_key = None
+            print("✅ Public Key از Embedded بارگذاری شد")
+            return
+        except Exception as e:
+            print(f"⚠️ خطا در بارگذاری Embedded Key: {e}")
         
-        print("⚠️ کلید عمومی یافت نشد! برنامه با محدودیت اجرا می‌شه.")
+        # ۳. شکست
+        print("❌ کلید عمومی در دسترس نیست! برنامه کار نمی‌کنه.")
         self.public_key = None
     
-    @staticmethod
-    def _get_embedded_public_key() -> Optional[str]:
-        """
-        کلید عمومی embed شده در کد
-        این توسط build_customer.py تنظیم میشه
-        """
-        # PLACEHOLDER - build_customer.py این رو پر می‌کنه
-        return None
-    
     def _load_seller_keys(self):
-        """بارگذاری کلیدهای فروشنده"""
+        """بارگذاری کلیدهای فروشنده از فایل"""
         try:
             with open(PUBLIC_KEY_PATH, 'rb') as f:
                 self.public_key = serialization.load_pem_public_key(
@@ -225,13 +249,13 @@ class LicenseCore:
         if env_pass:
             return env_pass.encode()
         
-        # از فایل محلی (فقط توسعه)
+        # از فایل محلی
         password_file = KEYS_DIR / "password.txt"
         if password_file.exists():
             try:
                 with open(password_file, 'rb') as f:
                     return f.read().strip()
-            except:
+            except Exception:
                 pass
         
         # تعاملی
@@ -240,7 +264,7 @@ class LicenseCore:
                 import getpass
                 password = getpass.getpass("🔐 رمز کلید خصوصی فروشنده: ")
                 return password.encode() if password else None
-            except:
+            except Exception:
                 return None
         
         return None
@@ -265,7 +289,7 @@ class LicenseCore:
             backend=default_backend()
         )
         
-        # ذخیره کلید خصوصی (رمزنگاری‌شده)
+        # ذخیره کلید خصوصی
         private_pem = private_key.private_bytes(
             encoding=serialization.Encoding.PEM,
             format=serialization.PrivateFormat.PKCS8,
@@ -303,7 +327,7 @@ class LicenseCore:
                 if len(key) == 32:
                     self._aes_key = key
                     return
-            except:
+            except Exception:
                 pass
         
         self._aes_key = os.urandom(32)
@@ -322,7 +346,7 @@ class LicenseCore:
         if REGISTRY_AVAILABLE:
             try:
                 return _get_machine_id_from_registry()
-            except:
+            except Exception:
                 pass
         
         # Fallback
@@ -339,7 +363,7 @@ class LicenseCore:
             data = '|'.join(components)
             hash_obj = hashlib.sha256(data.encode('utf-8'))
             return f"IACC-{hash_obj.hexdigest()[:32].upper()}"
-        except:
+        except Exception:
             return "IACC-FALLBACK-000000000000000000000000"
     
     @staticmethod
@@ -368,7 +392,7 @@ class LicenseCore:
             raise ValueError("❌ کلید خصوصی در دسترس نیست!")
         
         if modules is None:
-            modules = ['accounting', 'inventory', 'payroll', 'parties', 
+            modules = ['accounting', 'inventory', 'payroll', 'parties',
                       'invoice', 'purchase']
         
         if limits is None:
@@ -436,7 +460,7 @@ class LicenseCore:
     def verify_license(self, license_key: str) -> Dict:
         """بررسی لایسنس (کامل)"""
         try:
-            # ===== چک اگر لایسنس trial از پیش موجوده =====
+            # ===== چک اگر لایسنس trial =====
             if license_key == "TRIAL":
                 trial_data = self._load_trial_license()
                 if trial_data:
@@ -513,7 +537,7 @@ class LicenseCore:
             # بررسی انقضا
             try:
                 expire_date = datetime.fromisoformat(payload['expire_date'])
-            except:
+            except Exception:
                 return {
                     'valid': False,
                     'error': 'invalid_date',
@@ -551,17 +575,11 @@ class LicenseCore:
             }
     
     # ============================================================
-    # ========== Trial (نسخه آزمایشی) ==========
+    # ========== Trial ==========
     # ============================================================
     
     def create_trial_license(self) -> Dict:
-        """
-        ایجاد لایسنس آزمایشی 30 روزه
-        
-        فروشنده: خودش trial می‌سازه
-        مشتری: از Trial Certificate از پیش ساخته استفاده می‌کنه
-        """
-        # بررسی استفاده قبلی
+        """ایجاد لایسنس آزمایشی 30 روزه"""
         if self._is_trial_used():
             return {
                 'valid': False,
@@ -589,10 +607,9 @@ class LicenseCore:
                 is_trial=True
             )
             
-            # ذخیره به عنوان trial
             trial_data = license_data['data'].copy()
             trial_data['is_trial'] = True
-            trial_data['trial_signature'] = 'SELLER_SIGNED'  # علامت فروشنده
+            trial_data['trial_signature'] = 'SELLER_SIGNED'
             
             self._save_trial_license(trial_data)
             self._mark_trial_used()
@@ -612,13 +629,7 @@ class LicenseCore:
             }
     
     def _create_trial_as_customer(self) -> Dict:
-        """
-        مشتری: استفاده از Trial Certificate از پیش ساخته
-        
-        این گواهی توسط فروشنده ساخته شده و در بیلد قرار داره
-        مشتری HWID خودش رو جایگزین می‌کنه
-        """
-        # ===== ۱. بارگذاری Trial Certificate =====
+        """مشتری: استفاده از Trial Certificate"""
         cert_data = self._load_trial_certificate()
         
         if not cert_data:
@@ -631,11 +642,9 @@ class LicenseCore:
                 )
             }
         
-        # ===== ۲. ساخت trial برای این سیستم =====
         try:
             trial_payload = self._create_trial_from_certificate(cert_data)
             
-            # ذخیره
             self._save_trial_license(trial_payload)
             self._mark_trial_used()
             
@@ -670,18 +679,7 @@ class LicenseCore:
             return None
     
     def _parse_trial_certificate(self, cert_data: bytes) -> Optional[Dict]:
-        """
-        تجزیه Trial Certificate
-        
-        فرمت:
-        ┌────────────────────────────────┐
-        │ Magic: "ITRL" (4 bytes)         │
-        │ Version: 1 (1 byte)             │
-        │ Cert Length: 4 bytes            │
-        │ Certificate JSON: N bytes       │
-        │ Signature: 256 bytes (RSA 2048) │
-        └────────────────────────────────┘
-        """
+        """تجزیه Trial Certificate"""
         try:
             if len(cert_data) < 9:
                 return None
@@ -697,10 +695,8 @@ class LicenseCore:
             cert_json = cert_data[9:9+cert_len]
             signature = cert_data[9+cert_len:]
             
-            # تجزیه JSON
             cert = json.loads(cert_json.decode('utf-8'))
             
-            # بررسی امضا
             if self.public_key is None:
                 return None
             
@@ -730,12 +726,10 @@ class LicenseCore:
         now = datetime.now()
         expire_date = now + timedelta(days=cert.get('trial_days', 30))
         
-        # شناسه trial منحصر به فرد برای این سیستم
         trial_id = hashlib.sha256(
             f"TRIAL:{current_hwid}:{now.isoformat()}".encode()
         ).hexdigest()[:16].upper()
         
-        # کلید AES برای پلاگین‌ها
         plugin_aes_key = self._generate_plugin_aes_key(current_hwid, f"TRIAL_{trial_id}")
         
         trial_payload = {
@@ -753,7 +747,6 @@ class LicenseCore:
             'trial_cert_id': cert.get('cert_id', ''),
         }
         
-        # امضای trial (با استفاده از salt مشخص)
         trial_signature = hashlib.sha256(
             f"TRIAL:{current_hwid}:{trial_id}:{expire_date.isoformat()}:{cert.get('cert_id', '')}".encode()
             + TRIAL_SIGNATURE_SALT
@@ -766,7 +759,6 @@ class LicenseCore:
     def _verify_trial(self, trial: Dict) -> Dict:
         """بررسی trial license"""
         try:
-            # بررسی HWID
             current_hwid = self.get_machine_id()
             if trial.get('machine_id') != current_hwid:
                 return {
@@ -775,11 +767,9 @@ class LicenseCore:
                     'message': '❌ نسخه آزمایشی برای این سیستم صادر نشده است!'
                 }
             
-            # بررسی امضا
             trial_signature = trial.get('trial_signature', '')
             
             if trial_signature != 'SELLER_SIGNED':
-                # بررسی امضای محلی
                 trial_id = trial.get('license_id', '').replace('TRIAL_', '')
                 expire_date_str = trial.get('expire_date', '')
                 cert_id = trial.get('trial_cert_id', '')
@@ -796,10 +786,9 @@ class LicenseCore:
                         'message': '❌ نسخه آزمایشی دستکاری شده است!'
                     }
             
-            # بررسی انقضا
             try:
                 expire_date = datetime.fromisoformat(trial['expire_date'])
-            except:
+            except Exception:
                 return {
                     'valid': False,
                     'error': 'trial_invalid_date',
@@ -856,7 +845,7 @@ class LicenseCore:
         try:
             with open(TRIAL_FILE, 'r', encoding='utf-8') as f:
                 return json.load(f)
-        except:
+        except Exception:
             return None
     
     @staticmethod
@@ -877,7 +866,7 @@ class LicenseCore:
                     return value == 1
                 except FileNotFoundError:
                     winreg.CloseKey(key)
-            except:
+            except Exception:
                 pass
         else:
             marker = Path.home() / ".imanaccount" / ".trial_used"
@@ -898,7 +887,7 @@ class LicenseCore:
                 winreg.SetValueEx(key, "TrialUsed", 0, winreg.REG_DWORD, 1)
                 winreg.SetValueEx(key, "TrialDate", 0, winreg.REG_SZ, datetime.now().isoformat())
                 winreg.CloseKey(key)
-            except:
+            except Exception:
                 pass
         else:
             marker = Path.home() / ".imanaccount" / ".trial_used"
@@ -906,7 +895,7 @@ class LicenseCore:
             marker.write_text(datetime.now().isoformat())
     
     # ============================================================
-    # ========== Trial Certificate Builder (فقط فروشنده) ==========
+    # ========== Trial Certificate Builder ==========
     # ============================================================
     
     def build_trial_certificate(
@@ -915,12 +904,7 @@ class LicenseCore:
         modules: Optional[List[str]] = None,
         limits: Optional[Dict[str, int]] = None
     ) -> bytes:
-        """
-        ساخت Trial Certificate (فقط فروشنده)
-        
-        این گواهی در بیلد مشتری قرار می‌گیره و
-        به مشتری اجازه trial میده
-        """
+        """ساخت Trial Certificate (فقط فروشنده)"""
         if not self.is_seller:
             raise PermissionError("❌ فقط فروشنده!")
         
@@ -937,7 +921,6 @@ class LicenseCore:
                 'parties': 10, 'invoice': 10, 'purchase': 10
             }
         
-        # شناسه certificate
         cert_id = hashlib.sha256(
             f"TRIAL_CERT:{datetime.now().isoformat()}:{os.urandom(16).hex()}".encode()
         ).hexdigest()[:16].upper()
@@ -951,10 +934,8 @@ class LicenseCore:
             'version': '1.0.0',
         }
         
-        # سریالایز
         cert_json = json.dumps(cert, ensure_ascii=False, sort_keys=True).encode('utf-8')
         
-        # امضا
         signature = self.private_key.sign(
             cert_json,
             padding.PSS(
@@ -964,7 +945,6 @@ class LicenseCore:
             hashes.SHA256()
         )
         
-        # ساخت فایل
         result = bytearray()
         result += TRIAL_CERT_MAGIC
         result += bytes([TRIAL_CERT_VERSION])
@@ -1070,11 +1050,11 @@ class LicenseCore:
                 with open(target, 'r', encoding='utf-8') as f:
                     return f.read().strip()
             return None
-        except:
+        except Exception:
             return None
     
     # ============================================================
-    # ========== رمزنگاری پلاگین (فقط فروشنده) ==========
+    # ========== رمزنگاری پلاگین ==========
     # ============================================================
     
     def _generate_plugin_aes_key(self, machine_id: str, license_id: str) -> str:
@@ -1221,7 +1201,7 @@ class LicenseCore:
         
         try:
             decrypted = aesgcm.decrypt(nonce, encrypted_payload, header_bytes)
-        except:
+        except Exception:
             raise ValueError(
                 "❌ رمزگشایی ناموفق!\n"
                 "لایسنس شما برای این پلاگین معتبر نیست."
@@ -1268,7 +1248,7 @@ class LicenseCore:
             header_len = struct.unpack('>I', plugin_data[5:9])[0]
             header_bytes = plugin_data[9:9+header_len]
             return json.loads(header_bytes.decode('utf-8'))
-        except:
+        except Exception:
             return None
     
     @classmethod
@@ -1358,7 +1338,7 @@ class PluginSigner:
             )
             
             return True
-        except:
+        except Exception:
             return False
 
 
