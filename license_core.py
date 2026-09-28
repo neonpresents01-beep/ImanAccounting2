@@ -1,7 +1,12 @@
 # license_core.py
 # ============================================================
-# سیستم لایسنس ImanAccount - v4.0 (Product-Ready)
-# نسخه بازنویسی‌شده با Embedded Public Key
+# سیستم لایسنس ImanAccount - v5.1 (Self-Check Ready)
+# ============================================================
+# 
+# ✅ Embedded Public Key
+# ✅ فقط 1 فایل
+# ✅ Self-Check برای فروشنده
+# ✅ امنیت RSA 4096
 # ============================================================
 
 import os
@@ -32,16 +37,15 @@ try:
     REGISTRY_AVAILABLE = True
 except ImportError:
     REGISTRY_AVAILABLE = False
-    print("⚠️ registry_guard یافت نشد!")
 
 
 # ============================================================
 # ========== Embedded Public Key ==========
 # ============================================================
 # 
-# ⚠️ این کلید عمومی توسط فروشنده از فایل .keys/public_key.pem گرفته شده
-# ⚠️ برای اینکه نرم‌افزار مشتری بتونه لایسنس رو verify کنه
-# ⚠️ این کلید برای همه مشتری‌ها یکسانه
+# ⚠️ این کلید عمومی برای همه مشتری‌ها یکسانه
+# ⚠️ توسط فروشنده از Private Key استخراج شده
+# ⚠️ هیچ فایل جدا لازم نیست
 # 
 # ============================================================
 
@@ -62,43 +66,36 @@ ojRdmrTsuYPxdudMl07A2WUCAwEAAQ==
 
 
 # ============================================================
-# ========== مسیرهای امن ==========
+# ========== مسیرها ==========
 # ============================================================
 
 def _get_secure_dir() -> Path:
-    """مسیر امن برای ذخیره کلیدها (فقط توسعه‌دهنده)"""
     if os.name == 'nt':
         appdata = os.environ.get('APPDATA')
         base = Path(appdata) / "ImanAccount" / ".keys" if appdata else Path.home() / ".imanaccount" / ".keys"
     else:
         base = Path.home() / ".config" / "imanaccount" / ".keys"
-    
     base.mkdir(parents=True, exist_ok=True)
     return base
 
 
 def _get_user_data_dir() -> Path:
-    """مسیر اطلاعات کاربر (license, trial)"""
     if os.name == 'nt':
         appdata = os.environ.get('APPDATA')
         base = Path(appdata) / "ImanAccount" if appdata else Path.home() / ".imanaccount"
     else:
         base = Path.home() / ".config" / "imanaccount"
-    
     base.mkdir(parents=True, exist_ok=True)
     return base
 
 
 def _secure_file(file_path: Path):
-    """محدود کردن دسترسی فایل"""
     try:
         if os.name == 'nt':
             username = os.environ.get('USERNAME', '')
             if username:
                 subprocess.run(
-                    ['icacls', str(file_path),
-                     '/inheritance:r',
-                     '/grant:r', f'{username}:F'],
+                    ['icacls', str(file_path), '/inheritance:r', '/grant:r', f'{username}:F'],
                     check=False, capture_output=True, timeout=5
                 )
         else:
@@ -114,18 +111,12 @@ def _secure_file(file_path: Path):
 KEYS_DIR = _get_secure_dir()
 USER_DATA_DIR = _get_user_data_dir()
 
-PUBLIC_KEY_PATH = KEYS_DIR / "public_key.pem"
 PRIVATE_KEY_PATH = KEYS_DIR / "private_key.pem"
-TRIAL_CERT_PATH = Path(__file__).parent / "trial_certificate.bin"
-
 LICENSE_FILE = USER_DATA_DIR / "license.key"
 TRIAL_FILE = USER_DATA_DIR / "trial.license"
 
-# Trial Signature Salt (ثابت در همه نسخه‌ها)
-TRIAL_SIGNATURE_SALT = b"ImanAI_Trial_Cert_v4_2025"
-
-# Magic برای Trial Certificate
-TRIAL_CERT_MAGIC = b"ITRL"  # Iman TRiaL
+TRIAL_SIGNATURE_SALT = b"ImanAI_Trial_Cert_v5_2025"
+TRIAL_CERT_MAGIC = b"ITRL"
 TRIAL_CERT_VERSION = 1
 
 
@@ -134,27 +125,14 @@ TRIAL_CERT_VERSION = 1
 # ============================================================
 
 class LicenseCore:
-    """
-    سیستم لایسنس ImanAccount
-    
-    حالت فروشنده (is_seller=True):
-      - کلید خصوصی + عمومی
-      - تولید لایسنس
-      - تولید Trial Certificate
-    
-    حالت مشتری (is_seller=False):
-      - فقط کلید عمومی (embedded)
-      - بررسی لایسنس
-      - استفاده از Trial Certificate
-    """
+    """سیستم لایسنس ImanAccount v5.1"""
     
     IS_SELLER_BUILD = False
-    LICENSE_FORMAT_VERSION = "4.0.0"
+    LICENSE_FORMAT_VERSION = "5.1.0"
     
-    # پلاگین
     PLUGIN_MAGIC = b"IPLG"
     PLUGIN_FORMAT_VERSION = 3
-    PLUGIN_APP_SALT = b"ImanAI_Plugin_Encryption_Salt_v4_2025"
+    PLUGIN_APP_SALT = b"ImanAI_Plugin_Encryption_Salt_v5_2025"
     
     def __init__(self, is_seller: Optional[bool] = None):
         if is_seller is None:
@@ -165,67 +143,35 @@ class LicenseCore:
         self.private_key = None
         self._aes_key = None
         
-        # بارگذاری کلیدها
-        if self.is_seller:
-            self._init_seller_keys()
-        else:
-            self._init_customer_keys()
+        self._load_embedded_public_key()
         
-        # کلید AES (برای رمزنگاری لایسنس)
+        if self.is_seller:
+            self._load_seller_private_key()
+        
         self._init_aes_key()
     
     # ============================================================
-    # ========== مدیریت کلیدها ==========
+    # ========== Public Key (Embedded) ==========
     # ============================================================
     
-    def _init_seller_keys(self):
-        """فروشنده: کلید خصوصی + عمومی"""
-        if PRIVATE_KEY_PATH.exists() and PUBLIC_KEY_PATH.exists():
-            self._load_seller_keys()
-        else:
-            self._generate_seller_keys()
-    
-    def _init_customer_keys(self):
-        """مشتری: فقط کلید عمومی"""
-        
-        # ۱. تلاش از فایل
-        if PUBLIC_KEY_PATH.exists():
-            try:
-                with open(PUBLIC_KEY_PATH, 'rb') as f:
-                    self.public_key = serialization.load_pem_public_key(
-                        f.read(),
-                        backend=default_backend()
-                    )
-                self.private_key = None
-                return
-            except Exception as e:
-                print(f"⚠️ خطا در بارگذاری کلید عمومی از فایل: {e}")
-        
-        # ۲. تلاش از Embedded Key
+    def _load_embedded_public_key(self):
         try:
             self.public_key = serialization.load_pem_public_key(
                 EMBEDDED_PUBLIC_KEY.encode('utf-8'),
                 backend=default_backend()
             )
-            self.private_key = None
-            print("✅ Public Key از Embedded بارگذاری شد")
-            return
         except Exception as e:
-            print(f"⚠️ خطا در بارگذاری Embedded Key: {e}")
-        
-        # ۳. شکست
-        print("❌ کلید عمومی در دسترس نیست! برنامه کار نمی‌کنه.")
-        self.public_key = None
+            print(f"❌ خطا در بارگذاری Embedded Public Key: {e}")
+            self.public_key = None
     
-    def _load_seller_keys(self):
-        """بارگذاری کلیدهای فروشنده از فایل"""
-        try:
-            with open(PUBLIC_KEY_PATH, 'rb') as f:
-                self.public_key = serialization.load_pem_public_key(
-                    f.read(), backend=default_backend()
-                )
-        except Exception as e:
-            print(f"⚠️ خطا در بارگذاری کلید عمومی: {e}")
+    # ============================================================
+    # ========== Private Key (Seller) ==========
+    # ============================================================
+    
+    def _load_seller_private_key(self):
+        if not PRIVATE_KEY_PATH.exists():
+            self.private_key = None
+            return
         
         try:
             with open(PRIVATE_KEY_PATH, 'rb') as f:
@@ -238,18 +184,14 @@ class LicenseCore:
                 password=password,
                 backend=default_backend()
             )
-        except Exception as e:
-            print(f"⚠️ خطا در بارگذاری کلید خصوصی: {e}")
+        except Exception:
             self.private_key = None
     
     def _get_key_password(self) -> Optional[bytes]:
-        """دریافت رمز کلید خصوصی"""
-        # از ENV
         env_pass = os.environ.get('IMANACCOUNT_KEY_PASSWORD')
         if env_pass:
             return env_pass.encode()
         
-        # از فایل محلی
         password_file = KEYS_DIR / "password.txt"
         if password_file.exists():
             try:
@@ -258,66 +200,17 @@ class LicenseCore:
             except Exception:
                 pass
         
-        # تعاملی
         if sys.stdin.isatty():
             try:
                 import getpass
-                password = getpass.getpass("🔐 رمز کلید خصوصی فروشنده: ")
+                password = getpass.getpass("🔐 رمز Private Key: ")
                 return password.encode() if password else None
             except Exception:
                 return None
         
         return None
     
-    def _generate_seller_keys(self):
-        """تولید کلیدهای فروشنده"""
-        if not self.is_seller:
-            raise PermissionError("❌ فقط فروشنده!")
-        
-        print("🔑 تولید کلیدهای RSA 4096-bit فروشنده...")
-        
-        password = self._get_key_password()
-        if not password:
-            raise ValueError(
-                "❌ رمز کلید خصوصی الزامی است!\n"
-                "متغیر محیطی IMANACCOUNT_KEY_PASSWORD را تنظیم کنید."
-            )
-        
-        private_key = rsa.generate_private_key(
-            public_exponent=65537,
-            key_size=4096,
-            backend=default_backend()
-        )
-        
-        # ذخیره کلید خصوصی
-        private_pem = private_key.private_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.PKCS8,
-            encryption_algorithm=serialization.BestAvailableEncryption(password)
-        )
-        
-        with open(PRIVATE_KEY_PATH, 'wb') as f:
-            f.write(private_pem)
-        _secure_file(PRIVATE_KEY_PATH)
-        
-        # ذخیره کلید عمومی
-        public_key = private_key.public_key()
-        public_pem = public_key.public_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PublicFormat.SubjectPublicKeyInfo
-        )
-        
-        with open(PUBLIC_KEY_PATH, 'wb') as f:
-            f.write(public_pem)
-        _secure_file(PUBLIC_KEY_PATH)
-        
-        self.private_key = private_key
-        self.public_key = public_key
-        
-        print(f"✅ کلیدها ذخیره شدند در {KEYS_DIR}")
-    
     def _init_aes_key(self):
-        """کلید AES محلی"""
         aes_path = KEYS_DIR / "aes.key"
         
         if aes_path.exists():
@@ -337,19 +230,157 @@ class LicenseCore:
         _secure_file(aes_path)
     
     # ============================================================
+    # ========== Init Seller ==========
+    # ============================================================
+    
+    @classmethod
+    def init_seller_keys(cls, password: str = None) -> bool:
+        """ساخت Private Key برای فروشنده"""
+        try:
+            if password is None:
+                password = os.environ.get('IMANACCOUNT_KEY_PASSWORD')
+            
+            if not password:
+                print("❌ رمز Private Key الزامی است!")
+                return False
+            
+            password_bytes = password.encode()
+            
+            if PRIVATE_KEY_PATH.exists():
+                print(f"✅ Private Key قبلاً ساخته شده")
+                return True
+            
+            print("🔑 ساخت RSA 4096-bit Private Key...")
+            
+            private_key = rsa.generate_private_key(
+                public_exponent=65537,
+                key_size=4096,
+                backend=default_backend()
+            )
+            
+            private_pem = private_key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.PKCS8,
+                encryption_algorithm=serialization.BestAvailableEncryption(password_bytes)
+            )
+            
+            with open(PRIVATE_KEY_PATH, 'wb') as f:
+                f.write(private_pem)
+            _secure_file(PRIVATE_KEY_PATH)
+            
+            public_pem = private_key.public_key().public_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PublicFormat.SubjectPublicKeyInfo
+            ).decode('utf-8')
+            
+            print()
+            print("=" * 70)
+            print("📋 Public Key (این رو تو EMBEDDED_PUBLIC_KEY پیست کن):")
+            print("=" * 70)
+            print(public_pem)
+            print("=" * 70)
+            print()
+            print(f"✅ Private Key ذخیره شد: {PRIVATE_KEY_PATH}")
+            
+            return True
+        
+        except Exception as e:
+            print(f"❌ خطا: {e}")
+            return False
+    
+    # ============================================================
+    # ========== Self-Check (جدید!) ==========
+    # ============================================================
+    
+    def self_check(self) -> Dict:
+        """
+        چک کردن سیستم لایسنس
+        
+        Returns:
+            {
+                'ok': bool,
+                'checks': {
+                    'private_key': bool,
+                    'public_key': bool,
+                    'match': bool,
+                    'aes_key': bool
+                },
+                'message': str
+            }
+        """
+        result = {
+            'ok': False,
+            'checks': {
+                'private_key': self.private_key is not None,
+                'public_key': self.public_key is not None,
+                'match': False,
+                'aes_key': self._aes_key is not None,
+            },
+            'message': ''
+        }
+        
+        # ===== چک Private Key =====
+        if not self.private_key:
+            result['message'] = "❌ Private Key یافت نشد"
+            return result
+        
+        # ===== چک Public Key =====
+        if not self.public_key:
+            result['message'] = "❌ Public Key یافت نشد"
+            return result
+        
+        # ===== چک Match =====
+        try:
+            # یه تست ساده: امضا کن و verify کن
+            test_data = b"test_data_for_self_check"
+            
+            signature = self.private_key.sign(
+                test_data,
+                padding.PSS(
+                    mgf=padding.MGF1(hashes.SHA256()),
+                    salt_length=padding.PSS.MAX_LENGTH
+                ),
+                hashes.SHA256()
+            )
+            
+            self.public_key.verify(
+                signature,
+                test_data,
+                padding.PSS(
+                    mgf=padding.MGF1(hashes.SHA256()),
+                    salt_length=padding.PSS.MAX_LENGTH
+                ),
+                hashes.SHA256()
+            )
+            
+            result['checks']['match'] = True
+        
+        except Exception as e:
+            result['message'] = f"❌ Private و Public Key match نمی‌کنن: {e}"
+            return result
+        
+        # ===== چک AES =====
+        if not self._aes_key:
+            result['message'] = "❌ AES Key یافت نشد"
+            return result
+        
+        # ===== همه چیز OK =====
+        result['ok'] = True
+        result['message'] = "✅ همه چیز درسته"
+        return result
+    
+    # ============================================================
     # ========== HWID ==========
     # ============================================================
     
     @staticmethod
     def get_machine_id() -> str:
-        """دریافت HWID"""
         if REGISTRY_AVAILABLE:
             try:
                 return _get_machine_id_from_registry()
             except Exception:
                 pass
         
-        # Fallback
         try:
             import uuid
             components = [
@@ -371,7 +402,7 @@ class LicenseCore:
         return LicenseCore.get_machine_id()
     
     # ============================================================
-    # ========== تولید لایسنس (فقط فروشنده) ==========
+    # ========== Generate License ==========
     # ============================================================
     
     def generate_license(
@@ -389,7 +420,7 @@ class LicenseCore:
             raise PermissionError("❌ فقط فروشنده!")
         
         if self.private_key is None:
-            raise ValueError("❌ کلید خصوصی در دسترس نیست!")
+            raise ValueError("❌ Private Key در دسترس نیست!")
         
         if modules is None:
             modules = ['accounting', 'inventory', 'payroll', 'parties',
@@ -401,7 +432,6 @@ class LicenseCore:
         if machine_id is None:
             machine_id = self.get_machine_id()
         
-        # شناسه یکتا
         license_id = hashlib.sha256(
             f"{customer_name}|{machine_id}|{datetime.now().isoformat()}|{os.urandom(16).hex()}".encode()
         ).hexdigest()[:16].upper()
@@ -409,7 +439,6 @@ class LicenseCore:
         now = datetime.now()
         expire_date = now + timedelta(days=expire_days)
         
-        # کلید AES برای پلاگین‌ها
         plugin_aes_key = self._generate_plugin_aes_key(machine_id, license_id)
         
         payload = {
@@ -426,7 +455,6 @@ class LicenseCore:
             'is_trial': is_trial,
         }
         
-        # امضا
         payload_bytes = json.dumps(
             payload, ensure_ascii=False, sort_keys=True
         ).encode('utf-8')
@@ -454,13 +482,12 @@ class LicenseCore:
         }
     
     # ============================================================
-    # ========== بررسی لایسنس ==========
+    # ========== Verify License ==========
     # ============================================================
     
     def verify_license(self, license_key: str) -> Dict:
-        """بررسی لایسنس (کامل)"""
+        """بررسی لایسنس"""
         try:
-            # ===== چک اگر لایسنس trial =====
             if license_key == "TRIAL":
                 trial_data = self._load_trial_license()
                 if trial_data:
@@ -471,12 +498,11 @@ class LicenseCore:
                     'message': '❌ لایسنس آزمایشی فعال نشده است!'
                 }
             
-            # ===== لایسنس معمولی =====
             if self.public_key is None:
                 return {
                     'valid': False,
                     'error': 'no_public_key',
-                    'message': '❌ کلید عمومی در دسترس نیست!'
+                    'message': '❌ Public Key در دسترس نیست!'
                 }
             
             clean_key = license_key.strip().replace('-', '').replace(' ', '')
@@ -504,7 +530,6 @@ class LicenseCore:
                 payload, ensure_ascii=False, sort_keys=True
             ).encode('utf-8')
             
-            # بررسی امضا
             try:
                 self.public_key.verify(
                     signature,
@@ -522,19 +547,14 @@ class LicenseCore:
                     'message': '❌ لایسنس دستکاری شده است!'
                 }
             
-            # بررسی HWID
             current_machine_id = self.get_machine_id()
             if payload.get('machine_id') != current_machine_id:
                 return {
                     'valid': False,
                     'error': 'machine_mismatch',
-                    'message': (
-                        f'❌ این لایسنس برای این سیستم صادر نشده است!\n'
-                        f'HWID سیستم شما: {current_machine_id}'
-                    )
+                    'message': f'❌ این لایسنس برای این سیستم صادر نشده است!\nHWID: {current_machine_id}'
                 }
             
-            # بررسی انقضا
             try:
                 expire_date = datetime.fromisoformat(payload['expire_date'])
             except Exception:
@@ -550,11 +570,7 @@ class LicenseCore:
                 return {
                     'valid': False,
                     'error': 'expired',
-                    'message': (
-                        f'❌ لایسنس منقضی شده است!\n'
-                        f'تاریخ انقضا: {expire_date.strftime("%Y-%m-%d")}\n'
-                        f'({days_expired} روز پیش)'
-                    )
+                    'message': f'❌ لایسنس منقضی شده است!\n({days_expired} روز پیش)'
                 }
             
             days_left = (expire_date - now).days
@@ -579,12 +595,11 @@ class LicenseCore:
     # ============================================================
     
     def create_trial_license(self) -> Dict:
-        """ایجاد لایسنس آزمایشی 30 روزه"""
         if self._is_trial_used():
             return {
                 'valid': False,
                 'error': 'trial_used',
-                'message': '❌ نسخه آزمایشی قبلاً در این سیستم استفاده شده است!'
+                'message': '❌ نسخه آزمایشی قبلاً استفاده شده است!'
             }
         
         if self.is_seller:
@@ -593,17 +608,10 @@ class LicenseCore:
             return self._create_trial_as_customer()
     
     def _create_trial_as_seller(self) -> Dict:
-        """فروشنده: تولید trial با امضای واقعی"""
         try:
             license_data = self.generate_license(
-                customer_name="نسخه آزمایشی ImanAccount",
+                customer_name="نسخه آزمایشی",
                 expire_days=30,
-                modules=['accounting', 'inventory', 'payroll', 'parties',
-                        'invoice', 'purchase', 'ai', 'reports'],
-                limits={
-                    'accounting': 50, 'inventory': 20, 'payroll': 5,
-                    'parties': 10, 'invoice': 10, 'purchase': 10
-                },
                 is_trial=True
             )
             
@@ -629,22 +637,17 @@ class LicenseCore:
             }
     
     def _create_trial_as_customer(self) -> Dict:
-        """مشتری: استفاده از Trial Certificate"""
         cert_data = self._load_trial_certificate()
         
         if not cert_data:
             return {
                 'valid': False,
                 'error': 'no_trial_certificate',
-                'message': (
-                    '❌ نسخه آزمایشی در این برنامه فعال نیست!\n'
-                    'برای دریافت لایسنس با پشتیبانی تماس بگیرید.'
-                )
+                'message': '❌ نسخه آزمایشی در این برنامه فعال نیست!'
             }
         
         try:
             trial_payload = self._create_trial_from_certificate(cert_data)
-            
             self._save_trial_license(trial_payload)
             self._mark_trial_used()
             
@@ -661,34 +664,29 @@ class LicenseCore:
             return {
                 'valid': False,
                 'error': 'trial_failed',
-                'message': f'❌ خطا در فعال‌سازی: {str(e)}'
+                'message': f'❌ خطا: {str(e)}'
             }
     
     def _load_trial_certificate(self) -> Optional[Dict]:
-        """بارگذاری Trial Certificate"""
-        if not TRIAL_CERT_PATH.exists():
+        trial_cert_path = Path(__file__).parent / "trial_certificate.bin"
+        
+        if not trial_cert_path.exists():
             return None
         
         try:
-            with open(TRIAL_CERT_PATH, 'rb') as f:
+            with open(trial_cert_path, 'rb') as f:
                 cert_data = f.read()
-            
             return self._parse_trial_certificate(cert_data)
-        except Exception as e:
-            print(f"⚠️ خطا در بارگذاری Trial Certificate: {e}")
+        except Exception:
             return None
     
     def _parse_trial_certificate(self, cert_data: bytes) -> Optional[Dict]:
-        """تجزیه Trial Certificate"""
         try:
             if len(cert_data) < 9:
                 return None
-            
             if cert_data[:4] != TRIAL_CERT_MAGIC:
                 return None
-            
-            version = cert_data[4]
-            if version != TRIAL_CERT_VERSION:
+            if cert_data[4] != TRIAL_CERT_VERSION:
                 return None
             
             cert_len = struct.unpack('>I', cert_data[5:9])[0]
@@ -711,18 +709,14 @@ class LicenseCore:
                     hashes.SHA256()
                 )
             except InvalidSignature:
-                print("❌ امضای Trial Certificate نامعتبر است!")
                 return None
             
             return cert
-        except Exception as e:
-            print(f"⚠️ خطا در تجزیه Trial Certificate: {e}")
+        except Exception:
             return None
     
     def _create_trial_from_certificate(self, cert: Dict) -> Dict:
-        """ساخت trial license از certificate"""
         current_hwid = self.get_machine_id()
-        
         now = datetime.now()
         expire_date = now + timedelta(days=cert.get('trial_days', 30))
         
@@ -737,7 +731,7 @@ class LicenseCore:
             'customer': 'نسخه آزمایشی',
             'company': '',
             'machine_id': current_hwid,
-            'modules': cert.get('modules', ['accounting', 'inventory', 'payroll']),
+            'modules': cert.get('modules', []),
             'limits': cert.get('limits', {}),
             'plugin_aes_key': plugin_aes_key,
             'created_at': now.isoformat(),
@@ -757,7 +751,6 @@ class LicenseCore:
         return trial_payload
     
     def _verify_trial(self, trial: Dict) -> Dict:
-        """بررسی trial license"""
         try:
             current_hwid = self.get_machine_id()
             if trial.get('machine_id') != current_hwid:
@@ -801,12 +794,7 @@ class LicenseCore:
                 return {
                     'valid': False,
                     'error': 'trial_expired',
-                    'message': (
-                        f'❌ نسخه آزمایشی منقضی شده است!\n'
-                        f'تاریخ انقضا: {expire_date.strftime("%Y-%m-%d")}\n'
-                        f'({days_expired} روز پیش)\n'
-                        f'برای خرید نسخه کامل با پشتیبانی تماس بگیرید.'
-                    )
+                    'message': f'❌ نسخه آزمایشی منقضی شده ({days_expired} روز پیش)'
                 }
             
             days_left = (expire_date - now).days
@@ -816,7 +804,7 @@ class LicenseCore:
                 'data': trial,
                 'days_left': days_left,
                 'is_trial': True,
-                'message': f'✅ نسخه آزمایشی معتبر | {days_left} روز باقیمانده',
+                'message': f'✅ نسخه آزمایشی معتبر | {days_left} روز',
                 'is_expiring_soon': days_left <= 7
             }
         
@@ -828,20 +816,17 @@ class LicenseCore:
             }
     
     # ============================================================
-    # ========== ذخیره و بارگذاری Trial ==========
+    # ========== Save/Load Trial ==========
     # ============================================================
     
     def _save_trial_license(self, payload: Dict):
-        """ذخیره trial"""
         with open(TRIAL_FILE, 'w', encoding='utf-8') as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
         _secure_file(TRIAL_FILE)
     
     def _load_trial_license(self) -> Optional[Dict]:
-        """بارگذاری trial"""
         if not TRIAL_FILE.exists():
             return None
-        
         try:
             with open(TRIAL_FILE, 'r', encoding='utf-8') as f:
                 return json.load(f)
@@ -850,7 +835,6 @@ class LicenseCore:
     
     @staticmethod
     def _is_trial_used() -> bool:
-        """بررسی استفاده از trial"""
         if os.name == 'nt':
             try:
                 import winreg
@@ -876,7 +860,6 @@ class LicenseCore:
     
     @staticmethod
     def _mark_trial_used():
-        """علامت‌گذاری trial"""
         if os.name == 'nt':
             try:
                 import winreg
@@ -904,12 +887,11 @@ class LicenseCore:
         modules: Optional[List[str]] = None,
         limits: Optional[Dict[str, int]] = None
     ) -> bytes:
-        """ساخت Trial Certificate (فقط فروشنده)"""
         if not self.is_seller:
             raise PermissionError("❌ فقط فروشنده!")
         
         if self.private_key is None:
-            raise ValueError("❌ کلید خصوصی در دسترس نیست!")
+            raise ValueError("❌ Private Key در دسترس نیست!")
         
         if modules is None:
             modules = ['accounting', 'inventory', 'payroll', 'parties',
@@ -954,29 +936,11 @@ class LicenseCore:
         
         return bytes(result)
     
-    def save_trial_certificate(self, output_path: Optional[str] = None) -> bool:
-        """ذخیره Trial Certificate"""
-        try:
-            cert_data = self.build_trial_certificate()
-            
-            if output_path is None:
-                output_path = TRIAL_CERT_PATH
-            
-            with open(output_path, 'wb') as f:
-                f.write(cert_data)
-            
-            print(f"✅ Trial Certificate ذخیره شد در: {output_path}")
-            return True
-        except Exception as e:
-            print(f"❌ خطا: {e}")
-            return False
-    
     # ============================================================
-    # ========== رمزنگاری AES ==========
+    # ========== AES ==========
     # ============================================================
     
     def _encrypt_data(self, data: dict) -> str:
-        """رمزنگاری AES-GCM"""
         if self._aes_key is None:
             raise ValueError("کلید AES در دسترس نیست!")
         
@@ -991,13 +955,12 @@ class LicenseCore:
         return base64.b64encode(nonce + encrypted).decode('ascii')
     
     def _decrypt_data(self, encrypted_key: str) -> dict:
-        """رمزگشایی AES-GCM"""
         if self._aes_key is None:
             raise ValueError("کلید AES در دسترس نیست!")
         
         clean = encrypted_key.strip().replace('-', '').replace(' ', '')
-        padding = (4 - len(clean) % 4) % 4
-        clean += '=' * padding
+        padding_len = (4 - len(clean) % 4) % 4
+        clean += '=' * padding_len
         
         combined = base64.b64decode(clean)
         
@@ -1013,22 +976,16 @@ class LicenseCore:
         return json.loads(data_bytes.decode('utf-8'))
     
     # ============================================================
-    # ========== فرمت‌دهی ==========
+    # ========== Helpers ==========
     # ============================================================
     
     @staticmethod
     def _format_license_key(key: str) -> str:
-        """فرمت‌دهی کلید"""
         clean = key.replace('-', '').replace(' ', '').replace('_', '')
         groups = [clean[i:i+4] for i in range(0, len(clean), 4)]
         return '-'.join(groups)
     
-    # ============================================================
-    # ========== ذخیره/بارگذاری لایسنس ==========
-    # ============================================================
-    
     def save_license(self, license_key: str, file_path: Optional[str] = None) -> bool:
-        """ذخیره لایسنس"""
         try:
             target = Path(file_path) if file_path else LICENSE_FILE
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -1038,12 +995,10 @@ class LicenseCore:
             
             _secure_file(target)
             return True
-        except Exception as e:
-            print(f"⚠️ خطا: {e}")
+        except Exception:
             return False
     
     def load_license(self, file_path: Optional[str] = None) -> Optional[str]:
-        """بارگذاری لایسنس"""
         try:
             target = Path(file_path) if file_path else LICENSE_FILE
             if target.exists():
@@ -1053,12 +1008,7 @@ class LicenseCore:
         except Exception:
             return None
     
-    # ============================================================
-    # ========== رمزنگاری پلاگین ==========
-    # ============================================================
-    
     def _generate_plugin_aes_key(self, machine_id: str, license_id: str) -> str:
-        """تولید کلید AES برای پلاگین‌ها"""
         key_material = f"{machine_id}:{license_id}".encode('utf-8')
         
         key = hashlib.pbkdf2_hmac(
@@ -1072,7 +1022,6 @@ class LicenseCore:
         return base64.b64encode(key).decode('ascii')
     
     def get_plugin_aes_key(self, license_data: Dict) -> bytes:
-        """دریافت کلید AES پلاگین"""
         if 'plugin_aes_key' in license_data:
             return base64.b64decode(license_data['plugin_aes_key'])
         
@@ -1092,276 +1041,29 @@ class LicenseCore:
             dklen=32
         )
     
-    def encrypt_plugin(
-        self,
-        manifest: Dict,
-        code: str,
-        license_data: Dict,
-        sign: bool = True
-    ) -> bytes:
-        """رمزنگاری پلاگین"""
-        if not self.is_seller:
-            raise PermissionError("❌ فقط فروشنده!")
-        
-        if sign and self.private_key:
-            manifest_json = json.dumps(manifest, ensure_ascii=False, sort_keys=True)
-            data_to_sign = manifest_json + "\n---\n" + code
-            
-            signature = self.private_key.sign(
-                data_to_sign.encode('utf-8'),
-                padding.PSS(
-                    mgf=padding.MGF1(hashes.SHA256()),
-                    salt_length=padding.PSS.MAX_LENGTH
-                ),
-                hashes.SHA256()
-            )
-            
-            manifest = manifest.copy()
-            manifest['signature'] = base64.b64encode(signature).decode('ascii')
-        
-        header = {
-            'id': manifest.get('id', 'unknown'),
-            'name': manifest.get('name', ''),
-            'version': manifest.get('version', '1.0.0'),
-            'author': manifest.get('author', 'ImanAI'),
-            'type': manifest.get('type', 'internal'),
-            'required_modules': manifest.get('required_modules', []),
-            'required_license': manifest.get('required_license', ''),
-            'description': manifest.get('description', ''),
-            'icon': manifest.get('icon', '🔌'),
-            'encrypted': True,
-            'signed': sign and self.private_key is not None,
-            'format_version': self.PLUGIN_FORMAT_VERSION,
-        }
-        
-        header_json = json.dumps(header, ensure_ascii=False, sort_keys=True)
-        header_bytes = header_json.encode('utf-8')
-        
-        payload = {
-            'manifest': manifest,
-            'code': code,
-        }
-        
-        payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-        payload_bytes = payload_json.encode('utf-8')
-        
-        aes_key = self.get_plugin_aes_key(license_data)
-        
-        aesgcm = AESGCM(aes_key)
-        nonce = os.urandom(12)
-        aad = header_bytes
-        
-        encrypted_payload = aesgcm.encrypt(nonce, payload_bytes, aad)
-        
-        result = bytearray()
-        result += self.PLUGIN_MAGIC
-        result += bytes([self.PLUGIN_FORMAT_VERSION])
-        result += struct.pack('>I', len(header_bytes))
-        result += header_bytes
-        result += nonce
-        result += encrypted_payload
-        
-        return bytes(result)
-    
-    def decrypt_plugin(self, plugin_data: bytes, license_data: Dict) -> Tuple[Dict, str]:
-        """رمزگشایی پلاگین"""
-        if len(plugin_data) < 9:
-            raise ValueError("❌ فایل خیلی کوچک")
-        
-        if plugin_data[:4] != self.PLUGIN_MAGIC:
-            raise ValueError("❌ فایل نامعتبر")
-        
-        version = plugin_data[4]
-        if version != self.PLUGIN_FORMAT_VERSION:
-            raise ValueError(f"❌ نسخه پشتیبانی نمی‌شه: v{version}")
-        
-        header_len = struct.unpack('>I', plugin_data[5:9])[0]
-        
-        if len(plugin_data) < 9 + header_len + 12 + 16:
-            raise ValueError("❌ فایل ناقص")
-        
-        header_bytes = plugin_data[9:9+header_len]
-        header = json.loads(header_bytes.decode('utf-8'))
-        
-        if not header.get('encrypted'):
-            raise ValueError("❌ فایل رمزنگاری نشده")
-        
-        try:
-            aes_key = self.get_plugin_aes_key(license_data)
-        except ValueError:
-            raise ValueError(
-                "❌ لایسنس نامعتبر: نمی‌توان کلید رمزگشایی را ساخت."
-            )
-        
-        offset = 9 + header_len
-        nonce = plugin_data[offset:offset+12]
-        encrypted_payload = plugin_data[offset+12:]
-        
-        aesgcm = AESGCM(aes_key)
-        
-        try:
-            decrypted = aesgcm.decrypt(nonce, encrypted_payload, header_bytes)
-        except Exception:
-            raise ValueError(
-                "❌ رمزگشایی ناموفق!\n"
-                "لایسنس شما برای این پلاگین معتبر نیست."
-            )
-        
-        payload = json.loads(decrypted.decode('utf-8'))
-        manifest = payload.get('manifest', header)
-        code = payload.get('code', '')
-        
-        # بررسی امضا
-        signature = manifest.get('signature', '')
-        if signature and self.public_key:
-            try:
-                manifest_copy = manifest.copy()
-                manifest_copy.pop('signature', None)
-                manifest_json = json.dumps(
-                    manifest_copy, ensure_ascii=False, sort_keys=True
-                )
-                data_to_verify = manifest_json + "\n---\n" + code
-                
-                sig_bytes = base64.b64decode(signature)
-                
-                self.public_key.verify(
-                    sig_bytes,
-                    data_to_verify.encode('utf-8'),
-                    padding.PSS(
-                        mgf=padding.MGF1(hashes.SHA256()),
-                        salt_length=padding.PSS.MAX_LENGTH
-                    ),
-                    hashes.SHA256()
-                )
-            except InvalidSignature:
-                raise ValueError("❌ امضای پلاگین نامعتبر است!")
-        
-        return manifest, code
-    
-    @classmethod
-    def read_plugin_header(cls, plugin_data: bytes) -> Optional[Dict]:
-        """خواندن Header پلاگین"""
-        try:
-            if plugin_data[:4] != cls.PLUGIN_MAGIC:
-                return None
-            
-            header_len = struct.unpack('>I', plugin_data[5:9])[0]
-            header_bytes = plugin_data[9:9+header_len]
-            return json.loads(header_bytes.decode('utf-8'))
-        except Exception:
-            return None
-    
-    @classmethod
-    def is_encrypted_plugin(cls, plugin_data: bytes) -> bool:
-        """بررسی رمزنگاری"""
-        header = cls.read_plugin_header(plugin_data)
-        return header and header.get('encrypted', False)
-    
     # ============================================================
-    # ========== اطلاعات ==========
+    # ========== Info ==========
     # ============================================================
     
     def get_public_key_pem(self) -> str:
-        """کلید عمومی"""
-        if not self.public_key:
-            return ""
-        return self.public_key.public_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PublicFormat.SubjectPublicKeyInfo
-        ).decode('utf-8')
+        return EMBEDDED_PUBLIC_KEY
+    
+    def get_public_key_short(self) -> str:
+        """Public Key کوتاه برای نمایش"""
+        # خط دوم PEM
+        lines = EMBEDDED_PUBLIC_KEY.strip().split('\n')
+        if len(lines) >= 2:
+            return lines[1][:40] + "..."
+        return "..."
     
     @staticmethod
     def get_keys_info() -> Dict:
-        """اطلاعات کلیدها"""
         return {
             'keys_directory': str(KEYS_DIR),
-            'public_key_exists': PUBLIC_KEY_PATH.exists(),
             'private_key_exists': PRIVATE_KEY_PATH.exists(),
-            'trial_cert_exists': TRIAL_CERT_PATH.exists(),
+            'public_key_embedded': True,
             'is_seller_build': LicenseCore.IS_SELLER_BUILD,
         }
-
-
-# ============================================================
-# ========== کلاس‌های کمکی ==========
-# ============================================================
-
-class PluginSigner:
-    """امضا و بررسی امضای پلاگین‌ها"""
-    
-    def __init__(self):
-        self.core = get_license_core()
-    
-    def sign_plugin_data(self, data: str) -> str:
-        if not self.core.is_seller or not self.core.private_key:
-            raise PermissionError("❌ فقط فروشنده!")
-        
-        signature = self.core.private_key.sign(
-            data.encode('utf-8'),
-            padding.PSS(
-                mgf=padding.MGF1(hashes.SHA256()),
-                salt_length=padding.PSS.MAX_LENGTH
-            ),
-            hashes.SHA256()
-        )
-        
-        return base64.b64encode(signature).decode('ascii')
-    
-    def verify_plugin_signature(
-        self,
-        data: str,
-        signature: str,
-        public_key_pem: str = None
-    ) -> bool:
-        try:
-            if public_key_pem:
-                public_key = serialization.load_pem_public_key(
-                    public_key_pem.encode('utf-8'),
-                    backend=default_backend()
-                )
-            else:
-                public_key = self.core.public_key
-            
-            if public_key is None:
-                return False
-            
-            sig_bytes = base64.b64decode(signature)
-            
-            public_key.verify(
-                sig_bytes,
-                data.encode('utf-8'),
-                padding.PSS(
-                    mgf=padding.MGF1(hashes.SHA256()),
-                    salt_length=padding.PSS.MAX_LENGTH
-                ),
-                hashes.SHA256()
-            )
-            
-            return True
-        except Exception:
-            return False
-
-
-class LicenseManager:
-    """مدیریت لایسنس"""
-    
-    def __init__(self):
-        self.core = get_license_core()
-    
-    def verify_license(self, license_key: str) -> Dict:
-        return self.core.verify_license(license_key)
-    
-    def generate_license(self, *args, **kwargs) -> Dict:
-        return self.core.generate_license(*args, **kwargs)
-    
-    def create_trial_license(self) -> Dict:
-        return self.core.create_trial_license()
-    
-    def save_license(self, license_key: str, file_path: str = None) -> bool:
-        return self.core.save_license(license_key, file_path)
-    
-    def load_license(self, file_path: str = None) -> Optional[str]:
-        return self.core.load_license(file_path)
 
 
 # ============================================================
@@ -1387,8 +1089,52 @@ def get_machine_id() -> str:
 
 
 def get_public_key() -> str:
-    return get_license_core().get_public_key_pem()
+    return EMBEDDED_PUBLIC_KEY
 
 
-# Alias
 LicenseGenerator = LicenseCore
+
+
+# ============================================================
+# ========== CLI ==========
+# ============================================================
+
+if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="ImanAccount License Core v5.1")
+    parser.add_argument("--init-seller", action="store_true",
+                       help="ساخت Private Key فروشنده")
+    parser.add_argument("--password", type=str, default=None)
+    parser.add_argument("--self-check", action="store_true",
+                       help="چک کردن سیستم لایسنس")
+    
+    args = parser.parse_args()
+    
+    if args.init_seller:
+        print("=" * 70)
+        print("🔑 ساخت Private Key فروشنده")
+        print("=" * 70)
+        success = LicenseCore.init_seller_keys(password=args.password)
+        if success:
+            print()
+            print("✅ تمام!")
+    
+    elif args.self_check:
+        print("=" * 70)
+        print("🔍 Self-Check")
+        print("=" * 70)
+        
+        core = LicenseCore(is_seller=True)
+        result = core.self_check()
+        
+        print()
+        print(f"Private Key: {'✅' if result['checks']['private_key'] else '❌'}")
+        print(f"Public Key:  {'✅' if result['checks']['public_key'] else '❌'}")
+        print(f"Match:       {'✅' if result['checks']['match'] else '❌'}")
+        print(f"AES Key:     {'✅' if result['checks']['aes_key'] else '❌'}")
+        print()
+        print(result['message'])
+    
+    else:
+        parser.print_help()
