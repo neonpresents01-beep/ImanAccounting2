@@ -1,46 +1,104 @@
-﻿name: Build ImanAccount
+name: 🚀 Build ImanAccount
 
 on:
   push:
     branches: [ main, master ]
   workflow_dispatch:
+  release:
+    types: [ created ]
 
 jobs:
   # ═══════════════════════════════════════════════════════════
   # Build 32-bit OneFile + Installer
   # ═══════════════════════════════════════════════════════════
   build-32bit:
-    name: Build 32-bit + Installer
+    name: 🔨 Build 32-bit + Installer
     runs-on: windows-latest
     
     steps:
       - name: 📥 Checkout code
         uses: actions/checkout@v4
       
-      - name: 🐍 Setup Python 3.8 32-bit
+      - name: 🐍 Setup Python 3.10 32-bit
         uses: actions/setup-python@v5
         with:
-          python-version: '3.8'
+          python-version: '3.10'
           architecture: 'x86'
+          cache: 'pip'
       
       - name: 📦 Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pyinstaller==5.13.2
-          python -m pip install PyQt5==5.15.9
+          python -m pip install pyinstaller==6.3.0
+          python -m pip install PyQt5==5.15.10
           python -m pip install PyQtChart==5.15.6
           python -m pip install persiantools==4.0.0
           python -m pip install reportlab==3.6.13
           python -m pip install bcrypt==4.0.1
           python -m pip install arabic-reshaper==3.0.0
           python -m pip install python-bidi==0.4.2
-          python -m pip install cryptography==3.4.8
-          python -m pip install pillow==9.5.0
+          python -m pip install cryptography==41.0.7
+          python -m pip install pillow==10.1.0
           python -m pip install requests==2.31.0
       
-      - name: 🏗️ Build OneFile
+      - name: 🔍 Check trial_certificate.bin
+        shell: pwsh
         run: |
-          python -m PyInstaller --onefile --windowed --icon=Icon.ico --name=ImanAccount --add-data="fonts;fonts" --add-data="Icon.ico;." --collect-all PyQt5 --collect-all PyQtChart --hidden-import=PyQt5.QtPrintSupport --hidden-import=PyQt5.QtChart --hidden-import=PyQt5.QtSvg --hidden-import=PyQt5.QtXml --hidden-import=PyQt5.QtNetwork --hidden-import=PyQt5.sip --hidden-import=persiantools --hidden-import=reportlab --hidden-import=bcrypt --hidden-import=arabic_reshaper --hidden-import=bidi --hidden-import=cryptography --hidden-import=cryptography.hazmat --hidden-import=cryptography.hazmat.backends --hidden-import=cryptography.hazmat.backends.openssl --hidden-import=PIL --hidden-import=requests --hidden-import=license_core --hidden-import=registry_guard --hidden-import=database --hidden-import=security --noupx --clean --noconfirm main2.py
+          if (Test-Path "trial_certificate.bin") {
+            Write-Host "✅ trial_certificate.bin موجود است"
+            Get-Item "trial_certificate.bin" | Select-Object Name, Length
+          } else {
+            Write-Host "⚠️ trial_certificate.bin یافت نشد - Trial کار نخواهد کرد"
+          }
+      
+      - name: 🏗️ Build OneFile
+        shell: cmd
+        run: |
+          python -m PyInstaller --onefile --windowed ^
+            --icon=Icon.ico ^
+            --name=ImanAccount ^
+            --add-data="fonts;fonts" ^
+            --add-data="Icon.ico;." ^
+            --add-data="trial_certificate.bin;." ^
+            --collect-all PyQt5 ^
+            --collect-all PyQtChart ^
+            --collect-all cryptography ^
+            --hidden-import=PyQt5.QtPrintSupport ^
+            --hidden-import=PyQt5.QtChart ^
+            --hidden-import=PyQt5.QtSvg ^
+            --hidden-import=PyQt5.QtXml ^
+            --hidden-import=PyQt5.QtNetwork ^
+            --hidden-import=PyQt5.sip ^
+            --hidden-import=persiantools ^
+            --hidden-import=reportlab ^
+            --hidden-import=bcrypt ^
+            --hidden-import=arabic_reshaper ^
+            --hidden-import=bidi ^
+            --hidden-import=cryptography ^
+            --hidden-import=cryptography.hazmat ^
+            --hidden-import=cryptography.hazmat.backends ^
+            --hidden-import=cryptography.hazmat.backends.openssl ^
+            --hidden-import=PIL ^
+            --hidden-import=requests ^
+            --hidden-import=license_core ^
+            --hidden-import=registry_guard ^
+            --hidden-import=database ^
+            --hidden-import=security ^
+            --noupx ^
+            --clean ^
+            --noconfirm ^
+            main2.py
+      
+      - name: 🧪 Test Build
+        shell: pwsh
+        run: |
+          if (Test-Path "dist/ImanAccount.exe") {
+            Write-Host "✅ EXE ساخته شد"
+            Get-Item "dist/ImanAccount.exe" | Select-Object Name, Length
+          } else {
+            Write-Host "❌ EXE ساخته نشد!"
+            exit 1
+          }
       
       - name: 📤 Upload OneFile
         uses: actions/upload-artifact@v4
@@ -67,37 +125,93 @@ jobs:
   # Build 64-bit OneFile + Installer
   # ═══════════════════════════════════════════════════════════
   build-64bit:
-    name: Build 64-bit + Installer
+    name: 🔨 Build 64-bit + Installer
     runs-on: windows-latest
     
     steps:
       - name: 📥 Checkout code
         uses: actions/checkout@v4
       
-      - name: 🐍 Setup Python 3.8 64-bit
+      - name: 🐍 Setup Python 3.10 64-bit
         uses: actions/setup-python@v5
         with:
-          python-version: '3.8'
+          python-version: '3.10'
           architecture: 'x64'
+          cache: 'pip'
       
       - name: 📦 Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pyinstaller==5.13.2
-          python -m pip install PyQt5==5.15.9
+          python -m pip install pyinstaller==6.3.0
+          python -m pip install PyQt5==5.15.10
           python -m pip install PyQtChart==5.15.6
           python -m pip install persiantools==4.0.0
           python -m pip install reportlab==3.6.13
           python -m pip install bcrypt==4.0.1
           python -m pip install arabic-reshaper==3.0.0
           python -m pip install python-bidi==0.4.2
-          python -m pip install cryptography==3.4.8
-          python -m pip install pillow==9.5.0
+          python -m pip install cryptography==41.0.7
+          python -m pip install pillow==10.1.0
           python -m pip install requests==2.31.0
       
-      - name: 🏗️ Build OneFile
+      - name: 🔍 Check trial_certificate.bin
+        shell: pwsh
         run: |
-          python -m PyInstaller --onefile --windowed --icon=Icon.ico --name=ImanAccount --add-data="fonts;fonts" --add-data="Icon.ico;." --collect-all PyQt5 --collect-all PyQtChart --hidden-import=PyQt5.QtPrintSupport --hidden-import=PyQt5.QtChart --hidden-import=PyQt5.QtSvg --hidden-import=PyQt5.QtXml --hidden-import=PyQt5.QtNetwork --hidden-import=PyQt5.sip --hidden-import=persiantools --hidden-import=reportlab --hidden-import=bcrypt --hidden-import=arabic_reshaper --hidden-import=bidi --hidden-import=cryptography --hidden-import=cryptography.hazmat --hidden-import=cryptography.hazmat.backends --hidden-import=cryptography.hazmat.backends.openssl --hidden-import=PIL --hidden-import=requests --hidden-import=license_core --hidden-import=registry_guard --hidden-import=database --hidden-import=security --noupx --clean --noconfirm main2.py
+          if (Test-Path "trial_certificate.bin") {
+            Write-Host "✅ trial_certificate.bin موجود است"
+            Get-Item "trial_certificate.bin" | Select-Object Name, Length
+          } else {
+            Write-Host "⚠️ trial_certificate.bin یافت نشد - Trial کار نخواهد کرد"
+          }
+      
+      - name: 🏗️ Build OneFile
+        shell: cmd
+        run: |
+          python -m PyInstaller --onefile --windowed ^
+            --icon=Icon.ico ^
+            --name=ImanAccount ^
+            --add-data="fonts;fonts" ^
+            --add-data="Icon.ico;." ^
+            --add-data="trial_certificate.bin;." ^
+            --collect-all PyQt5 ^
+            --collect-all PyQtChart ^
+            --collect-all cryptography ^
+            --hidden-import=PyQt5.QtPrintSupport ^
+            --hidden-import=PyQt5.QtChart ^
+            --hidden-import=PyQt5.QtSvg ^
+            --hidden-import=PyQt5.QtXml ^
+            --hidden-import=PyQt5.QtNetwork ^
+            --hidden-import=PyQt5.sip ^
+            --hidden-import=persiantools ^
+            --hidden-import=reportlab ^
+            --hidden-import=bcrypt ^
+            --hidden-import=arabic_reshaper ^
+            --hidden-import=bidi ^
+            --hidden-import=cryptography ^
+            --hidden-import=cryptography.hazmat ^
+            --hidden-import=cryptography.hazmat.backends ^
+            --hidden-import=cryptography.hazmat.backends.openssl ^
+            --hidden-import=PIL ^
+            --hidden-import=requests ^
+            --hidden-import=license_core ^
+            --hidden-import=registry_guard ^
+            --hidden-import=database ^
+            --hidden-import=security ^
+            --noupx ^
+            --clean ^
+            --noconfirm ^
+            main2.py
+      
+      - name: 🧪 Test Build
+        shell: pwsh
+        run: |
+          if (Test-Path "dist/ImanAccount.exe") {
+            Write-Host "✅ EXE ساخته شد"
+            Get-Item "dist/ImanAccount.exe" | Select-Object Name, Length
+          } else {
+            Write-Host "❌ EXE ساخته نشد!"
+            exit 1
+          }
       
       - name: 📤 Upload OneFile
         uses: actions/upload-artifact@v4
@@ -119,3 +233,156 @@ jobs:
           name: ImanAccount-Installer-64bit
           path: installer_output/
           retention-days: 30
+
+  # ═══════════════════════════════════════════════════════════
+  # Auto Release (فقط وقتی Tag می‌زنی)
+  # ═══════════════════════════════════════════════════════════
+  release:
+    name: 📦 Create Release
+    needs: [build-32bit, build-64bit]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+      
+      - name: 📥 Download 32-bit OneFile
+        uses: actions/download-artifact@v4
+        with:
+          name: ImanAccount-OneFile-32bit
+          path: ./release/32bit/
+      
+      - name: 📥 Download 32-bit Installer
+        uses: actions/download-artifact@v4
+        with:
+          name: ImanAccount-Installer-32bit
+          path: ./release/installer-32bit/
+      
+      - name: 📥 Download 64-bit OneFile
+        uses: actions/download-artifact@v4
+        with:
+          name: ImanAccount-OneFile-64bit
+          path: ./release/64bit/
+      
+      - name: 📥 Download 64-bit Installer
+        uses: actions/download-artifact@v4
+        with:
+          name: ImanAccount-Installer-64bit
+          path: ./release/installer-64bit/
+      
+      - name: 📦 Prepare Release Files
+        run: |
+          mkdir -p ./release/final
+          
+          # OneFile
+          mv ./release/32bit/ImanAccount.exe ./release/final/ImanAccount-32bit.exe
+          mv ./release/64bit/ImanAccount.exe ./release/final/ImanAccount-64bit.exe
+          
+          # Installers
+          for f in ./release/installer-32bit/*; do
+            if [ -f "$f" ]; then
+              name=$(basename "$f")
+              cp "$f" "./release/final/32bit-${name}"
+            fi
+          done
+          
+          for f in ./release/installer-64bit/*; do
+            if [ -f "$f" ]; then
+              name=$(basename "$f")
+              cp "$f" "./release/final/64bit-${name}"
+            fi
+          done
+          
+          echo "📁 Files:"
+          ls -la ./release/final/
+      
+      - name: 📝 Generate Changelog
+        run: |
+          echo "## 🎉 ImanAccount ${{ github.ref_name }}" > CHANGELOG_RELEASE.md
+          echo "" >> CHANGELOG_RELEASE.md
+          echo "### 📥 دانلود" >> CHANGELOG_RELEASE.md
+          echo "" >> CHANGELOG_RELEASE.md
+          echo "#### 🔷 نسخه 64-bit (پیشنهادی)" >> CHANGELOG_RELEASE.md
+          echo "- **OneFile**: \`ImanAccount-64bit.exe\`" >> CHANGELOG_RELEASE.md
+          echo "- **Installer**: \`64bit-ImanAccount-Setup.exe\`" >> CHANGELOG_RELEASE.md
+          echo "" >> CHANGELOG_RELEASE.md
+          echo "#### 🔶 نسخه 32-bit (برای ویندوزهای قدیمی)" >> CHANGELOG_RELEASE.md
+          echo "- **OneFile**: \`ImanAccount-32bit.exe\`" >> CHANGELOG_RELEASE.md
+          echo "- **Installer**: \`32bit-ImanAccount-Setup.exe\`" >> CHANGELOG_RELEASE.md
+          echo "" >> CHANGELOG_RELEASE.md
+          echo "### 🚀 ویژگی‌ها" >> CHANGELOG_RELEASE.md
+          echo "" >> CHANGELOG_RELEASE.md
+          echo "- ✅ حسابداری کامل (سند، دفتر روزنامه، دفتر کل)" >> CHANGELOG_RELEASE.md
+          echo "- ✅ انبارداری (چند انباره، سریال، بارکد)" >> CHANGELOG_RELEASE.md
+          echo "- ✅ حقوق و دستمزد (بیمه، مالیات، اضافه کاری)" >> CHANGELOG_RELEASE.md
+          echo "- ✅ خرید و فروش (فاکتور، چاپ PDF)" >> CHANGELOG_RELEASE.md
+          echo "- ✅ هوش مصنوعی ImanAI" >> CHANGELOG_RELEASE.md
+          echo "- ✅ سیستم پلاگین" >> CHANGELOG_RELEASE.md
+          echo "- ✅ تم روشن/تاریک" >> CHANGELOG_RELEASE.md
+          echo "" >> CHANGELOG_RELEASE.md
+          echo "### 📋 نیازمندی‌ها" >> CHANGELOG_RELEASE.md
+          echo "" >> CHANGELOG_RELEASE.md
+          echo "| مورد | حداقل |" >> CHANGELOG_RELEASE.md
+          echo "|------|-------|" >> CHANGELOG_RELEASE.md
+          echo "| ویندوز | Windows 7 SP1 |" >> CHANGELOG_RELEASE.md
+          echo "| رم | 2 GB |" >> CHANGELOG_RELEASE.md
+          echo "| فضای خالی | 200 MB |" >> CHANGELOG_RELEASE.md
+          echo "" >> CHANGELOG_RELEASE.md
+          echo "### 📞 پشتیبانی" >> CHANGELOG_RELEASE.md
+          echo "" >> CHANGELOG_RELEASE.md
+          echo "- 📧 ایمیل: support@imanai.ir" >> CHANGELOG_RELEASE.md
+          echo "- 🌐 وب‌سایت: www.imanai.ir" >> CHANGELOG_RELEASE.md
+          echo "- 📱 تلگرام: @imanai_support" >> CHANGELOG_RELEASE.md
+          
+          cat CHANGELOG_RELEASE.md
+      
+      - name: 🚀 Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          name: 🚀 ImanAccount ${{ github.ref_name }}
+          body_path: CHANGELOG_RELEASE.md
+          files: |
+            ./release/final/ImanAccount-32bit.exe
+            ./release/final/ImanAccount-64bit.exe
+            ./release/final/32bit-ImanAccount-Setup.exe
+            ./release/final/64bit-ImanAccount-Setup.exe
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ═══════════════════════════════════════════════════════════
+  # Notification (اختیاری - اگه Telegram داری)
+  # ═══════════════════════════════════════════════════════════
+  notify:
+    name: 🔔 Notify
+    needs: [build-32bit, build-64bit]
+    if: always() && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: 📤 Send Telegram Notification
+        if: ${{ secrets.TELEGRAM_BOT_TOKEN != '' && secrets.TELEGRAM_CHAT_ID != '' }}
+        run: |
+          STATUS="${{ needs.build-32bit.result }}"
+          
+          if [ "$STATUS" = "success" ]; then
+            EMOJI="✅"
+            MSG="Build موفق!"
+          else
+            EMOJI="❌"
+            MSG="Build ناموفق!"
+          fi
+          
+          curl -s -X POST \
+            "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+            -d text="$EMOJI ImanAccount Build
+          
+          📦 ریپو: ${{ github.repository }}
+          🌿 شاخه: ${{ github.ref_name }}
+          📝 کامیت: ${{ github.event.head_commit.message }}
+          🔗 لینک: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          
+          $MSG"
