@@ -3,9 +3,19 @@ name: 🚀 Build ImanAccount
 on:
   push:
     branches: [ main, master ]
+    tags:
+      - 'v*'
   workflow_dispatch:
-  release:
-    types: [ created ]
+    inputs:
+      create_release:
+        description: 'Create GitHub Release?'
+        required: false
+        default: 'true'
+        type: boolean
+
+# ✅ Permission برای Release
+permissions:
+  contents: write
 
 jobs:
   # ═══════════════════════════════════════════════════════════
@@ -235,12 +245,11 @@ jobs:
           retention-days: 30
 
   # ═══════════════════════════════════════════════════════════
-  # Auto Release (فقط وقتی Tag می‌زنی)
+  # Auto Release (خودکار یا با Tag)
   # ═══════════════════════════════════════════════════════════
   release:
     name: 📦 Create Release
     needs: [build-32bit, build-64bit]
-    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     
     steps:
@@ -297,9 +306,21 @@ jobs:
           echo "📁 Files:"
           ls -la ./release/final/
       
+      - name: 🔢 Determine Version
+        id: version
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            VERSION="${{ github.ref_name }}"
+          else
+            VERSION="v1.0.$(date +%Y%m%d-%H%M)"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "📌 Version: $VERSION"
+      
       - name: 📝 Generate Changelog
         run: |
-          echo "## 🎉 ImanAccount ${{ github.ref_name }}" > CHANGELOG_RELEASE.md
+          VERSION="${{ steps.version.outputs.version }}"
+          echo "## 🎉 ImanAccount $VERSION" > CHANGELOG_RELEASE.md
           echo "" >> CHANGELOG_RELEASE.md
           echo "### 📥 دانلود" >> CHANGELOG_RELEASE.md
           echo "" >> CHANGELOG_RELEASE.md
@@ -337,9 +358,10 @@ jobs:
           cat CHANGELOG_RELEASE.md
       
       - name: 🚀 Create GitHub Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
-          name: 🚀 ImanAccount ${{ github.ref_name }}
+          tag_name: ${{ steps.version.outputs.version }}
+          name: 🚀 ImanAccount ${{ steps.version.outputs.version }}
           body_path: CHANGELOG_RELEASE.md
           files: |
             ./release/final/ImanAccount-32bit.exe
@@ -348,5 +370,6 @@ jobs:
             ./release/final/64bit-ImanAccount-Setup.exe
           draft: false
           prerelease: false
+          generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
