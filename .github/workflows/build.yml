@@ -1,131 +1,21 @@
-name: 🚀 Build ImanAccount
+name: 🚀 Build ImanAccount Installer
 
 on:
   push:
     branches: [ main, master ]
+    tags:
+      - 'v*'
   workflow_dispatch:
-  release:
-    types: [ created ]
+
+permissions:
+  contents: write
 
 jobs:
   # ═══════════════════════════════════════════════════════════
-  # Build 32-bit OneFile + Installer
-  # ═══════════════════════════════════════════════════════════
-  build-32bit:
-    name: 🔨 Build 32-bit + Installer
-    runs-on: windows-latest
-    
-    steps:
-      - name: 📥 Checkout code
-        uses: actions/checkout@v4
-      
-      - name: 🐍 Setup Python 3.10 32-bit
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-          architecture: 'x86'
-          cache: 'pip'
-      
-      - name: 📦 Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install pyinstaller==6.3.0
-          python -m pip install PyQt5==5.15.10
-          python -m pip install PyQtChart==5.15.6
-          python -m pip install persiantools==4.0.0
-          python -m pip install reportlab==3.6.13
-          python -m pip install bcrypt==4.0.1
-          python -m pip install arabic-reshaper==3.0.0
-          python -m pip install python-bidi==0.4.2
-          python -m pip install cryptography==41.0.7
-          python -m pip install pillow==10.1.0
-          python -m pip install requests==2.31.0
-      
-      - name: 🔍 Check trial_certificate.bin
-        shell: pwsh
-        run: |
-          if (Test-Path "trial_certificate.bin") {
-            Write-Host "✅ trial_certificate.bin موجود است"
-            Get-Item "trial_certificate.bin" | Select-Object Name, Length
-          } else {
-            Write-Host "⚠️ trial_certificate.bin یافت نشد - Trial کار نخواهد کرد"
-          }
-      
-      - name: 🏗️ Build OneFile
-        shell: cmd
-        run: |
-          python -m PyInstaller --onefile --windowed ^
-            --icon=Icon.ico ^
-            --name=ImanAccount ^
-            --add-data="fonts;fonts" ^
-            --add-data="Icon.ico;." ^
-            --add-data="trial_certificate.bin;." ^
-            --collect-all PyQt5 ^
-            --collect-all PyQtChart ^
-            --collect-all cryptography ^
-            --hidden-import=PyQt5.QtPrintSupport ^
-            --hidden-import=PyQt5.QtChart ^
-            --hidden-import=PyQt5.QtSvg ^
-            --hidden-import=PyQt5.QtXml ^
-            --hidden-import=PyQt5.QtNetwork ^
-            --hidden-import=PyQt5.sip ^
-            --hidden-import=persiantools ^
-            --hidden-import=reportlab ^
-            --hidden-import=bcrypt ^
-            --hidden-import=arabic_reshaper ^
-            --hidden-import=bidi ^
-            --hidden-import=cryptography ^
-            --hidden-import=cryptography.hazmat ^
-            --hidden-import=cryptography.hazmat.backends ^
-            --hidden-import=cryptography.hazmat.backends.openssl ^
-            --hidden-import=PIL ^
-            --hidden-import=requests ^
-            --hidden-import=license_core ^
-            --hidden-import=registry_guard ^
-            --hidden-import=database ^
-            --hidden-import=security ^
-            --noupx ^
-            --clean ^
-            --noconfirm ^
-            main2.py
-      
-      - name: 🧪 Test Build
-        shell: pwsh
-        run: |
-          if (Test-Path "dist/ImanAccount.exe") {
-            Write-Host "✅ EXE ساخته شد"
-            Get-Item "dist/ImanAccount.exe" | Select-Object Name, Length
-          } else {
-            Write-Host "❌ EXE ساخته نشد!"
-            exit 1
-          }
-      
-      - name: 📤 Upload OneFile
-        uses: actions/upload-artifact@v4
-        with:
-          name: ImanAccount-OneFile-32bit
-          path: dist/ImanAccount.exe
-          retention-days: 30
-      
-      - name: 📦 Install Inno Setup
-        run: choco install innosetup -y
-      
-      - name: 🏗️ Build Installer
-        run: |
-          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
-      
-      - name: 📤 Upload Installer
-        uses: actions/upload-artifact@v4
-        with:
-          name: ImanAccount-Installer-32bit
-          path: installer_output/
-          retention-days: 30
-
-  # ═══════════════════════════════════════════════════════════
-  # Build 64-bit OneFile + Installer
+  # Build 64-bit Installer (Win10/11)
   # ═══════════════════════════════════════════════════════════
   build-64bit:
-    name: 🔨 Build 64-bit + Installer
+    name: 🔨 Build 64-bit Installer (Win10/11)
     runs-on: windows-latest
     
     steps:
@@ -154,17 +44,19 @@ jobs:
           python -m pip install pillow==10.1.0
           python -m pip install requests==2.31.0
       
-      - name: 🔍 Check trial_certificate.bin
+      - name: 🔍 Check required files
         shell: pwsh
         run: |
-          if (Test-Path "trial_certificate.bin") {
-            Write-Host "✅ trial_certificate.bin موجود است"
-            Get-Item "trial_certificate.bin" | Select-Object Name, Length
-          } else {
-            Write-Host "⚠️ trial_certificate.bin یافت نشد - Trial کار نخواهد کرد"
+          $files = @("main2.py", "installer.iss", "Icon.ico", "trial_certificate.bin")
+          foreach ($f in $files) {
+            if (Test-Path $f) {
+              Write-Host "✅ $f موجود است"
+            } else {
+              Write-Host "⚠️ $f یافت نشد!"
+            }
           }
       
-      - name: 🏗️ Build OneFile
+      - name: 🏗️ Build EXE with PyInstaller
         shell: cmd
         run: |
           python -m PyInstaller --onefile --windowed ^
@@ -188,9 +80,6 @@ jobs:
             --hidden-import=arabic_reshaper ^
             --hidden-import=bidi ^
             --hidden-import=cryptography ^
-            --hidden-import=cryptography.hazmat ^
-            --hidden-import=cryptography.hazmat.backends ^
-            --hidden-import=cryptography.hazmat.backends.openssl ^
             --hidden-import=PIL ^
             --hidden-import=requests ^
             --hidden-import=license_core ^
@@ -202,68 +91,183 @@ jobs:
             --noconfirm ^
             main2.py
       
-      - name: 🧪 Test Build
+      - name: 🧪 Test EXE Build
         shell: pwsh
         run: |
           if (Test-Path "dist/ImanAccount.exe") {
-            Write-Host "✅ EXE ساخته شد"
-            Get-Item "dist/ImanAccount.exe" | Select-Object Name, Length
+            $size = (Get-Item "dist/ImanAccount.exe").Length / 1MB
+            Write-Host "✅ EXE ساخته شد - $([math]::Round($size, 2)) MB"
           } else {
             Write-Host "❌ EXE ساخته نشد!"
             exit 1
           }
       
-      - name: 📤 Upload OneFile
-        uses: actions/upload-artifact@v4
-        with:
-          name: ImanAccount-OneFile-64bit
-          path: dist/ImanAccount.exe
-          retention-days: 30
-      
       - name: 📦 Install Inno Setup
         run: choco install innosetup -y
       
       - name: 🏗️ Build Installer
+        shell: pwsh
         run: |
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
+          
+          if (Test-Path "installer_output/*.exe") {
+            Write-Host "✅ Installer ساخته شد"
+          } else {
+            Write-Host "❌ Installer ساخته نشد!"
+            exit 1
+          }
       
       - name: 📤 Upload Installer
         uses: actions/upload-artifact@v4
         with:
           name: ImanAccount-Installer-64bit
-          path: installer_output/
+          path: installer_output/*.exe
           retention-days: 30
 
   # ═══════════════════════════════════════════════════════════
-  # Auto Release (فقط وقتی Tag می‌زنی)
+  # Build 32-bit Installer (Win7 Compatible)
+  # ═══════════════════════════════════════════════════════════
+  build-32bit:
+    name: 🔨 Build 32-bit Installer (Win7 Compatible)
+    runs-on: windows-latest
+    
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+      
+      - name: 🐍 Setup Python 3.8 32-bit (Win7 Compatible)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.8'
+          architecture: 'x86'
+          cache: 'pip'
+      
+      - name: 📦 Install dependencies (Win7 Compatible Versions)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller==5.13.2
+          python -m pip install PyQt5==5.15.2
+          python -m pip install PyQtChart==5.15.2
+          python -m pip install persiantools==3.0.0
+          python -m pip install reportlab==3.5.68
+          python -m pip install bcrypt==3.2.0
+          python -m pip install arabic-reshaper==2.1.3
+          python -m pip install python-bidi==0.4.2
+          python -m pip install cryptography==3.4.8
+          python -m pip install pillow==8.4.0
+          python -m pip install requests==2.25.1
+      
+      - name: 📥 Download api-ms-win-core-path DLL (Win7 Hack)
+        shell: pwsh
+        run: |
+          # دانلود DLL سازگار با Win7 برای Python 3.8
+          $url = "https://github.com/nalexandru/api-ms-win-core-path-HACK/releases/download/0.3.1/api-ms-win-core-path-l1-1-0.zip"
+          Invoke-WebRequest -Uri $url -OutFile "dll-hack.zip"
+          Expand-Archive -Path "dll-hack.zip" -DestinationPath "dll-hack"
+          
+          # کپی DLL های 32-bit به پوشه فعلی
+          Copy-Item "dll-hack\x86\api-ms-win-core-path-l1-1-0.dll" -Destination "." -Force
+          
+          Write-Host "✅ DLL دانلود و کپی شد"
+          Get-Item "api-ms-win-core-path-l1-1-0.dll" | Select-Object Name, Length
+      
+      - name: 🔍 Check required files
+        shell: pwsh
+        run: |
+          $files = @("main2.py", "installer.iss", "Icon.ico", "trial_certificate.bin", "api-ms-win-core-path-l1-1-0.dll")
+          foreach ($f in $files) {
+            if (Test-Path $f) {
+              Write-Host "✅ $f موجود است"
+            } else {
+              Write-Host "⚠️ $f یافت نشد!"
+            }
+          }
+      
+      - name: 🏗️ Build EXE with PyInstaller (Win7 Compatible)
+        shell: cmd
+        run: |
+          python -m PyInstaller --onefile --windowed ^
+            --icon=Icon.ico ^
+            --name=ImanAccount ^
+            --add-data="fonts;fonts" ^
+            --add-data="Icon.ico;." ^
+            --add-data="trial_certificate.bin;." ^
+            --add-binary="api-ms-win-core-path-l1-1-0.dll;." ^
+            --collect-all PyQt5 ^
+            --collect-all PyQtChart ^
+            --collect-all cryptography ^
+            --hidden-import=PyQt5.QtPrintSupport ^
+            --hidden-import=PyQt5.QtChart ^
+            --hidden-import=PyQt5.QtSvg ^
+            --hidden-import=PyQt5.QtXml ^
+            --hidden-import=PyQt5.QtNetwork ^
+            --hidden-import=PyQt5.sip ^
+            --hidden-import=persiantools ^
+            --hidden-import=reportlab ^
+            --hidden-import=bcrypt ^
+            --hidden-import=arabic_reshaper ^
+            --hidden-import=bidi ^
+            --hidden-import=cryptography ^
+            --hidden-import=PIL ^
+            --hidden-import=requests ^
+            --hidden-import=license_core ^
+            --hidden-import=registry_guard ^
+            --hidden-import=database ^
+            --hidden-import=security ^
+            --noupx ^
+            --clean ^
+            --noconfirm ^
+            main2.py
+      
+      - name: 🧪 Test EXE Build
+        shell: pwsh
+        run: |
+          if (Test-Path "dist/ImanAccount.exe") {
+            $size = (Get-Item "dist/ImanAccount.exe").Length / 1MB
+            Write-Host "✅ EXE ساخته شد - $([math]::Round($size, 2)) MB"
+          } else {
+            Write-Host "❌ EXE ساخته نشد!"
+            exit 1
+          }
+      
+      - name: 📦 Install Inno Setup
+        run: choco install innosetup -y
+      
+      - name: 🏗️ Build Installer
+        shell: pwsh
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
+          
+          if (Test-Path "installer_output/*.exe") {
+            Write-Host "✅ Installer ساخته شد"
+          } else {
+            Write-Host "❌ Installer ساخته نشد!"
+            exit 1
+          }
+      
+      - name: 📤 Upload Installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: ImanAccount-Installer-32bit
+          path: installer_output/*.exe
+          retention-days: 30
+
+  # ═══════════════════════════════════════════════════════════
+  # Release
   # ═══════════════════════════════════════════════════════════
   release:
     name: 📦 Create Release
-    needs: [build-32bit, build-64bit]
-    if: startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-latest
+    needs: [build-64bit, build-32bit]
+    runs-on: ubuntu-22.04
+    
+    permissions:
+      contents: write
     
     steps:
       - name: 📥 Checkout
         uses: actions/checkout@v4
-      
-      - name: 📥 Download 32-bit OneFile
-        uses: actions/download-artifact@v4
         with:
-          name: ImanAccount-OneFile-32bit
-          path: ./release/32bit/
-      
-      - name: 📥 Download 32-bit Installer
-        uses: actions/download-artifact@v4
-        with:
-          name: ImanAccount-Installer-32bit
-          path: ./release/installer-32bit/
-      
-      - name: 📥 Download 64-bit OneFile
-        uses: actions/download-artifact@v4
-        with:
-          name: ImanAccount-OneFile-64bit
-          path: ./release/64bit/
+          fetch-depth: 0
       
       - name: 📥 Download 64-bit Installer
         uses: actions/download-artifact@v4
@@ -271,82 +275,83 @@ jobs:
           name: ImanAccount-Installer-64bit
           path: ./release/installer-64bit/
       
+      - name: 📥 Download 32-bit Installer
+        uses: actions/download-artifact@v4
+        with:
+          name: ImanAccount-Installer-32bit
+          path: ./release/installer-32bit/
+      
       - name: 📦 Prepare Release Files
         run: |
           mkdir -p ./release/final
-          
-          # OneFile
-          mv ./release/32bit/ImanAccount.exe ./release/final/ImanAccount-32bit.exe
-          mv ./release/64bit/ImanAccount.exe ./release/final/ImanAccount-64bit.exe
-          
-          # Installers
-          for f in ./release/installer-32bit/*; do
-            if [ -f "$f" ]; then
-              name=$(basename "$f")
-              cp "$f" "./release/final/32bit-${name}"
-            fi
-          done
-          
-          for f in ./release/installer-64bit/*; do
-            if [ -f "$f" ]; then
-              name=$(basename "$f")
-              cp "$f" "./release/final/64bit-${name}"
-            fi
-          done
-          
-          echo "📁 Files:"
+          find ./release/installer-64bit/ -type f -name "*.exe" -exec cp {} ./release/final/ImanAccount-Setup-64bit.exe \; 2>/dev/null || true
+          find ./release/installer-32bit/ -type f -name "*.exe" -exec cp {} ./release/final/ImanAccount-Setup-32bit.exe \; 2>/dev/null || true
+          echo "📁 Files prepared:"
           ls -la ./release/final/
+      
+      - name: 🔢 Determine Version
+        id: version
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            VERSION="${{ github.ref_name }}"
+          else
+            VERSION="v1.0.$(date +%Y%m%d-%H%M)"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "📌 Version: $VERSION"
       
       - name: 📝 Generate Changelog
         run: |
-          echo "## 🎉 ImanAccount ${{ github.ref_name }}" > CHANGELOG_RELEASE.md
-          echo "" >> CHANGELOG_RELEASE.md
-          echo "### 📥 دانلود" >> CHANGELOG_RELEASE.md
-          echo "" >> CHANGELOG_RELEASE.md
-          echo "#### 🔷 نسخه 64-bit (پیشنهادی)" >> CHANGELOG_RELEASE.md
-          echo "- **OneFile**: \`ImanAccount-64bit.exe\`" >> CHANGELOG_RELEASE.md
-          echo "- **Installer**: \`64bit-ImanAccount-Setup.exe\`" >> CHANGELOG_RELEASE.md
-          echo "" >> CHANGELOG_RELEASE.md
-          echo "#### 🔶 نسخه 32-bit (برای ویندوزهای قدیمی)" >> CHANGELOG_RELEASE.md
-          echo "- **OneFile**: \`ImanAccount-32bit.exe\`" >> CHANGELOG_RELEASE.md
-          echo "- **Installer**: \`32bit-ImanAccount-Setup.exe\`" >> CHANGELOG_RELEASE.md
-          echo "" >> CHANGELOG_RELEASE.md
-          echo "### 🚀 ویژگی‌ها" >> CHANGELOG_RELEASE.md
-          echo "" >> CHANGELOG_RELEASE.md
-          echo "- ✅ حسابداری کامل (سند، دفتر روزنامه، دفتر کل)" >> CHANGELOG_RELEASE.md
-          echo "- ✅ انبارداری (چند انباره، سریال، بارکد)" >> CHANGELOG_RELEASE.md
-          echo "- ✅ حقوق و دستمزد (بیمه، مالیات، اضافه کاری)" >> CHANGELOG_RELEASE.md
-          echo "- ✅ خرید و فروش (فاکتور، چاپ PDF)" >> CHANGELOG_RELEASE.md
-          echo "- ✅ هوش مصنوعی ImanAI" >> CHANGELOG_RELEASE.md
-          echo "- ✅ سیستم پلاگین" >> CHANGELOG_RELEASE.md
-          echo "- ✅ تم روشن/تاریک" >> CHANGELOG_RELEASE.md
-          echo "" >> CHANGELOG_RELEASE.md
-          echo "### 📋 نیازمندی‌ها" >> CHANGELOG_RELEASE.md
-          echo "" >> CHANGELOG_RELEASE.md
-          echo "| مورد | حداقل |" >> CHANGELOG_RELEASE.md
-          echo "|------|-------|" >> CHANGELOG_RELEASE.md
-          echo "| ویندوز | Windows 7 SP1 |" >> CHANGELOG_RELEASE.md
-          echo "| رم | 2 GB |" >> CHANGELOG_RELEASE.md
-          echo "| فضای خالی | 200 MB |" >> CHANGELOG_RELEASE.md
-          echo "" >> CHANGELOG_RELEASE.md
-          echo "### 📞 پشتیبانی" >> CHANGELOG_RELEASE.md
-          echo "" >> CHANGELOG_RELEASE.md
-          echo "- 📧 ایمیل: support@imanai.ir" >> CHANGELOG_RELEASE.md
-          echo "- 🌐 وب‌سایت: www.imanai.ir" >> CHANGELOG_RELEASE.md
+          VERSION="${{ steps.version.outputs.version }}"
+          cat > CHANGELOG_RELEASE.md << 'EOF'
+          ## 🎉 ImanAccount $VERSION
+          
+          ### 📥 دانلود
+          
+          #### 🔷 نسخه 64-bit (پیشنهادی — Win10/11)
+          - **Installer**: `ImanAccount-Setup-64bit.exe`
+          - نیازمندی: Windows 10 / 11 (64-bit)
+          
+          #### 🔶 نسخه 32-bit (ویندوزهای قدیمی)
+          - **Installer**: `ImanAccount-Setup-32bit.exe`
+          - نیازمندی: Windows 7 SP1 / 8 / 8.1 / 10
+          - ✅ سازگار با ویندوز 7
+          
+          ### 🚀 ویژگی‌ها
+          
+          - ✅ حسابداری کامل
+          - ✅ انبارداری
+          - ✅ حقوق و دستمزد
+          - ✅ خرید و فروش
+          - ✅ هوش مصنوعی ImanAI
+          - ✅ سیستم پلاگین
+          - ✅ تم روشن/تاریک
+          
+          ### 📋 نیازمندی‌ها
+          
+          | مورد | حداقل |
+          |------|-------|
+          | ویندوز | Windows 7 SP1 |
+          | رم | 2 GB |
+          | فضای خالی | 200 MB |
+          
+          ### 📞 پشتیبانی
+          
+          - 🌐 وب‌سایت: www.imanai.ir
+          EOF
           
           cat CHANGELOG_RELEASE.md
       
       - name: 🚀 Create GitHub Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
-          name: 🚀 ImanAccount ${{ github.ref_name }}
+          tag_name: ${{ steps.version.outputs.version }}
+          name: 🚀 ImanAccount ${{ steps.version.outputs.version }}
           body_path: CHANGELOG_RELEASE.md
           files: |
-            ./release/final/ImanAccount-32bit.exe
-            ./release/final/ImanAccount-64bit.exe
-            ./release/final/32bit-ImanAccount-Setup.exe
-            ./release/final/64bit-ImanAccount-Setup.exe
+            ./release/final/*.exe
           draft: false
           prerelease: false
+          generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

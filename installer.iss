@@ -2,6 +2,7 @@
 ; ============================================================
 ; ImanAccount Installer v3.0 (OneFile)
 ; English Only - GitHub Actions Compatible
+; Win7 Compatible (با DLL Hack)
 ; ============================================================
 
 #define MyAppName "ImanAccount"
@@ -79,10 +80,11 @@ english.DataDirDesc=Where should your data (database, logs, backups) be stored?
 
 [Files]
 ; ═══════════════════════════════════════════════
-; OneFile: فقط فایل exe
+; OneFile: فایل exe + DLL سازگار با Win7
 ; ═══════════════════════════════════════════════
 Source: "dist\ImanAccount.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "Icon.ico"; DestDir: "{app}"; Flags: ignoreversion
+Source: "api-ms-win-core-path-l1-1-0.dll"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 ; ═══════════════════════════════════════════════
@@ -110,6 +112,7 @@ Filename: "{cmd}"; Parameters: "/C taskkill /F /IM {#MyAppExeName} 2>nul"; Flags
 ; پاک کردن فایل‌ها
 ; ═══════════════════════════════════════════════
 Type: files; Name: "{app}\Icon.ico"
+Type: files; Name: "{app}\api-ms-win-core-path-l1-1-0.dll"
 
 [Code]
 var
