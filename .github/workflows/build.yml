@@ -7,13 +7,12 @@ on:
       - 'v*'
   workflow_dispatch:
 
-# ✅ Permission برای Release
 permissions:
   contents: write
 
 jobs:
   # ═══════════════════════════════════════════════════════════
-  # Build 64-bit Installer (نسخه اصلی - Win10/11)
+  # Build 64-bit Installer (Win10/11)
   # ═══════════════════════════════════════════════════════════
   build-64bit:
     name: 🔨 Build 64-bit Installer (Win10/11)
@@ -113,7 +112,6 @@ jobs:
           
           if (Test-Path "installer_output/*.exe") {
             Write-Host "✅ Installer ساخته شد"
-            Get-ChildItem "installer_output/*.exe" | Select-Object Name, Length
           } else {
             Write-Host "❌ Installer ساخته نشد!"
             exit 1
@@ -127,8 +125,7 @@ jobs:
           retention-days: 30
 
   # ═══════════════════════════════════════════════════════════
-  # Build 32-bit Installer (برای ویندوز 7 و ویندوزهای قدیمی)
-  # ✅ Python 3.8 - آخرین نسخه سازگار با ویندوز 7
+  # Build 32-bit Installer (Win7 Compatible)
   # ═══════════════════════════════════════════════════════════
   build-32bit:
     name: 🔨 Build 32-bit Installer (Win7 Compatible)
@@ -148,7 +145,7 @@ jobs:
       - name: 📦 Install dependencies (Win7 Compatible Versions)
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pyinstaller==4.10
+          python -m pip install pyinstaller==5.13.2
           python -m pip install PyQt5==5.15.2
           python -m pip install PyQtChart==5.15.2
           python -m pip install persiantools==3.0.0
@@ -160,10 +157,24 @@ jobs:
           python -m pip install pillow==8.4.0
           python -m pip install requests==2.25.1
       
+      - name: 📥 Download api-ms-win-core-path DLL (Win7 Hack)
+        shell: pwsh
+        run: |
+          # دانلود DLL سازگار با Win7 برای Python 3.8
+          $url = "https://github.com/nalexandru/api-ms-win-core-path-HACK/releases/download/0.3.1/api-ms-win-core-path-l1-1-0.zip"
+          Invoke-WebRequest -Uri $url -OutFile "dll-hack.zip"
+          Expand-Archive -Path "dll-hack.zip" -DestinationPath "dll-hack"
+          
+          # کپی DLL های 32-bit به پوشه فعلی
+          Copy-Item "dll-hack\x86\api-ms-win-core-path-l1-1-0.dll" -Destination "." -Force
+          
+          Write-Host "✅ DLL دانلود و کپی شد"
+          Get-Item "api-ms-win-core-path-l1-1-0.dll" | Select-Object Name, Length
+      
       - name: 🔍 Check required files
         shell: pwsh
         run: |
-          $files = @("main2.py", "installer.iss", "Icon.ico", "trial_certificate.bin")
+          $files = @("main2.py", "installer.iss", "Icon.ico", "trial_certificate.bin", "api-ms-win-core-path-l1-1-0.dll")
           foreach ($f in $files) {
             if (Test-Path $f) {
               Write-Host "✅ $f موجود است"
@@ -181,6 +192,7 @@ jobs:
             --add-data="fonts;fonts" ^
             --add-data="Icon.ico;." ^
             --add-data="trial_certificate.bin;." ^
+            --add-binary="api-ms-win-core-path-l1-1-0.dll;." ^
             --collect-all PyQt5 ^
             --collect-all PyQtChart ^
             --collect-all cryptography ^
@@ -228,7 +240,6 @@ jobs:
           
           if (Test-Path "installer_output/*.exe") {
             Write-Host "✅ Installer ساخته شد"
-            Get-ChildItem "installer_output/*.exe" | Select-Object Name, Length
           } else {
             Write-Host "❌ Installer ساخته نشد!"
             exit 1
@@ -242,7 +253,7 @@ jobs:
           retention-days: 30
 
   # ═══════════════════════════════════════════════════════════
-  # Release (خودکار — فقط Installerها)
+  # Release
   # ═══════════════════════════════════════════════════════════
   release:
     name: 📦 Create Release
@@ -273,13 +284,8 @@ jobs:
       - name: 📦 Prepare Release Files
         run: |
           mkdir -p ./release/final
-          
-          # 64-bit Installer
           find ./release/installer-64bit/ -type f -name "*.exe" -exec cp {} ./release/final/ImanAccount-Setup-64bit.exe \; 2>/dev/null || true
-          
-          # 32-bit Installer
           find ./release/installer-32bit/ -type f -name "*.exe" -exec cp {} ./release/final/ImanAccount-Setup-32bit.exe \; 2>/dev/null || true
-          
           echo "📁 Files prepared:"
           ls -la ./release/final/
       
@@ -308,15 +314,15 @@ jobs:
           
           #### 🔶 نسخه 32-bit (ویندوزهای قدیمی)
           - **Installer**: `ImanAccount-Setup-32bit.exe`
-          - نیازمندی: Windows 7 SP1 / 8 / 8.1 / 10 (32-bit & 64-bit)
+          - نیازمندی: Windows 7 SP1 / 8 / 8.1 / 10
           - ✅ سازگار با ویندوز 7
           
           ### 🚀 ویژگی‌ها
           
-          - ✅ حسابداری کامل (سند، دفتر روزنامه، دفتر کل)
-          - ✅ انبارداری (چند انباره، سریال، بارکد)
-          - ✅ حقوق و دستمزد (بیمه، مالیات، اضافه کاری)
-          - ✅ خرید و فروش (فاکتور، چاپ PDF)
+          - ✅ حسابداری کامل
+          - ✅ انبارداری
+          - ✅ حقوق و دستمزد
+          - ✅ خرید و فروش
           - ✅ هوش مصنوعی ImanAI
           - ✅ سیستم پلاگین
           - ✅ تم روشن/تاریک
