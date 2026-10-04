@@ -1,7 +1,7 @@
 # ui/inventory_widget.py
 # ============================================================
 # ویجت انبارداری پیشرفته ImanAccount
-# نسخه کامل با رفع تمام خطاها
+# نسخه کامل با رفع تمام خطاها + رفع مشکل انتقال انبار
 # ============================================================
 
 from PyQt5.QtWidgets import *
@@ -312,7 +312,7 @@ class ProductDialog(BaseDialog):
         self.warehouse_combo = QComboBox()
         self.warehouse_combo.setStyleSheet("padding: 8px; border: 1px solid #ddd; border-radius: 4px;")
         self.load_warehouses()
-        price_layout.addRow("🏢 انبار:", self.warehouse_combo)
+        price_layout.addRow("🏢 انبار پیش‌فرض:", self.warehouse_combo)
 
         self.tabs.addTab(price_tab, "💰 قیمت و موجودی")
 
@@ -402,7 +402,7 @@ class ProductDialog(BaseDialog):
                         code=?, name=?, category=?, unit=?, brand=?, model=?,
                         color=?, size=?, weight=?, barcode=?, has_serial=?,
                         expiry_date=?, location=?, purchase_price=?, sale_price=?,
-                        min_stock=?, max_stock=?, warehouse_id=?
+                        min_stock=?, max_stock=?, warehouse_id=?, updated_at=CURRENT_TIMESTAMP
                     WHERE id=?
                 ''', [
                     code, self.name.text().strip(), self.category.currentText(),
@@ -446,6 +446,7 @@ class StockTransactionDialog(BaseDialog):
         super().__init__(base_width=550, base_height=620)
         self.product = product
         self.trans_type = trans_type
+        self._total_value = 0
         self.setWindowTitle("📥 رسید انبار" if trans_type == 'in' else "📤 حواله انبار")
         self.setModal(True)
         self.setup_ui()
@@ -558,54 +559,70 @@ class StockTransactionDialog(BaseDialog):
             QMessageBox.warning(self, "خطا", "لطفاً انبار را انتخاب کنید!")
             return
 
-        with get_db() as conn:
-            c = conn.cursor()
+        try:
+            with get_db() as conn:
+                c = conn.cursor()
 
-            if self.trans_type == 'in':
+                if self.trans_type == 'in':
+                    # ✅ افزودن به انبار
+                    c.execute('''
+                        INSERT INTO warehouse_stock (product_id, warehouse_id, quantity, updated_at)
+                        VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                        ON CONFLICT(product_id, warehouse_id) DO UPDATE SET
+                            quantity = quantity + ?,
+                            updated_at = CURRENT_TIMESTAMP
+                    ''', [self.product['id'], warehouse_id, self.quantity.value(), self.quantity.value()])
+                else:
+                    # ✅ کم کردن از انبار
+                    c.execute('''
+                        UPDATE warehouse_stock 
+                        SET quantity = MAX(0, quantity - ?), updated_at = CURRENT_TIMESTAMP
+                        WHERE product_id = ? AND warehouse_id = ?
+                    ''', [self.quantity.value(), self.product['id'], warehouse_id])
+
+                # ✅ ثبت تراکنش
                 c.execute('''
-                    INSERT INTO warehouse_stock (product_id, warehouse_id, quantity)
-                    VALUES (?, ?, ?)
-                    ON CONFLICT(product_id, warehouse_id) DO UPDATE SET
-                        quantity = quantity + ?,
-                        updated_at = CURRENT_TIMESTAMP
-                ''', [self.product['id'], warehouse_id, self.quantity.value(), self.quantity.value()])
-            else:
-                c.execute('''
-                    UPDATE warehouse_stock SET quantity = quantity - ?, updated_at = CURRENT_TIMESTAMP
-                    WHERE product_id = ? AND warehouse_id = ?
-                ''', [self.quantity.value(), self.product['id'], warehouse_id])
+                    INSERT INTO stock_transactions (
+                        date, product_id, warehouse_id, type, quantity,
+                        unit_price, total_price, ref_no, description, serial_numbers
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', [
+                    self.date.get_shamsi(), self.product['id'], warehouse_id,
+                    self.trans_type, self.quantity.value(),
+                    self.unit_price.value(), self._total_value,
+                    self.ref_no.text(), self.description.toPlainText(),
+                    self.serial_numbers.toPlainText()
+                ])
 
-            c.execute('''
-                INSERT INTO stock_transactions (
-                    date, product_id, warehouse_id, type, quantity,
-                    unit_price, total_price, ref_no, description, serial_numbers
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', [
-                self.date.get_shamsi(), self.product['id'], warehouse_id,
-                self.trans_type, self.quantity.value(),
-                self.unit_price.value(), self._total_value,
-                self.ref_no.text(), self.description.toPlainText(),
-                self.serial_numbers.toPlainText()
-            ])
+                # ✅ بروزرسانی موجودی کل محصول
+                c.execute(
+                    "SELECT COALESCE(SUM(quantity), 0) FROM warehouse_stock WHERE product_id = ?",
+                    [self.product['id']]
+                )
+                total_stock = c.fetchone()[0] or 0
+                c.execute(
+                    "UPDATE products SET stock = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    [total_stock, self.product['id']]
+                )
 
-            c.execute("SELECT COALESCE(SUM(quantity), 0) FROM warehouse_stock WHERE product_id = ?", [self.product['id']])
-            total_stock = c.fetchone()[0] or 0
-            c.execute("UPDATE products SET stock = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", [total_stock, self.product['id']])
+                conn.commit()
+            super().accept()
 
-            conn.commit()
-        super().accept()
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            QMessageBox.warning(self, "خطا", f"❌ خطا در ثبت تراکنش: {e}")
 
 
 # ============================================================
 # دیالوگ انتقال بین انبارها
+# ✅ رفع خطای ۲ + رفع مشکل انتقال
 # ============================================================
 
 class StockTransferDialog(BaseDialog):
     def __init__(self, product):
-        super().__init__(base_width=550, base_height=550)
+        super().__init__(base_width=550, base_height=580)
         self.product = product
-        self.from_warehouse = None
-        self.to_warehouse = None
         self.setWindowTitle("🔄 انتقال کالا بین انبارها")
         self.setModal(True)
         self.setup_ui()
@@ -620,18 +637,21 @@ class StockTransferDialog(BaseDialog):
         title.setAlignment(Qt.AlignCenter)
         layout.addRow(title)
 
+        # ✅ اول from_warehouse رو بساز
         self.from_warehouse = QComboBox()
         self.from_warehouse.currentIndexChanged.connect(self.update_available_stock)
-        self.load_warehouses()
         layout.addRow("🏢 انبار مبدا:", self.from_warehouse)
 
         self.available_stock_label = QLabel("موجودی قابل انتقال: ۰")
-        self.available_stock_label.setStyleSheet("font-weight: bold; color: #273c75;")
+        self.available_stock_label.setStyleSheet("font-weight: bold; color: #273c75; padding: 5px;")
         layout.addRow(self.available_stock_label)
 
+        # ✅ بعد to_warehouse رو بساز
         self.to_warehouse = QComboBox()
-        self.load_warehouses()
         layout.addRow("🏢 انبار مقصد:", self.to_warehouse)
+
+        # ✅ حالا که هر دو ساخته شدن، load_warehouses رو صدا بزن
+        self.load_warehouses()
 
         line = QFrame()
         line.setFrameShape(QFrame.HLine)
@@ -667,37 +687,109 @@ class StockTransferDialog(BaseDialog):
 
         layout.addRow(btn_widget)
 
+        # ✅ بروزرسانی موجودی اولیه
         self.update_available_stock()
 
     def load_warehouses(self):
-        with get_db() as conn:
-            c = conn.cursor()
-            c.execute("SELECT id, code, name FROM warehouses WHERE is_active = 1 ORDER BY code")
-            rows = c.fetchall()
-            
-            self.from_warehouse.clear()
-            self.to_warehouse.clear()
-            
-            for row in rows:
-                self.from_warehouse.addItem(f"{row['code']} - {row['name']}", row['id'])
-                self.to_warehouse.addItem(f"{row['code']} - {row['name']}", row['id'])
-
-    def update_available_stock(self):
-        warehouse_id = self.from_warehouse.currentData()
-        if warehouse_id:
+        """بارگذاری لیست انبارها با چک ایمن برای هر دو combo"""
+        try:
             with get_db() as conn:
                 c = conn.cursor()
-                c.execute("SELECT quantity FROM warehouse_stock WHERE product_id = ? AND warehouse_id = ?", [self.product['id'], warehouse_id])
+                c.execute(
+                    "SELECT id, code, name FROM warehouses "
+                    "WHERE is_active = 1 ORDER BY code"
+                )
+                rows = c.fetchall()
+
+                # ✅ چک from_warehouse
+                if hasattr(self, 'from_warehouse') and self.from_warehouse is not None:
+                    self.from_warehouse.blockSignals(True)
+                    self.from_warehouse.clear()
+                    for row in rows:
+                        self.from_warehouse.addItem(
+                            f"{row['code']} - {row['name']}", row['id']
+                        )
+                    self.from_warehouse.blockSignals(False)
+
+                # ✅ چک to_warehouse
+                if hasattr(self, 'to_warehouse') and self.to_warehouse is not None:
+                    self.to_warehouse.clear()
+                    for row in rows:
+                        self.to_warehouse.addItem(
+                            f"{row['code']} - {row['name']}", row['id']
+                        )
+                    # ✅ اگه بیش از ۱ انبار، دومی رو انتخاب کن به عنوان پیش‌فرض مقصد
+                    if len(rows) >= 2:
+                        self.to_warehouse.setCurrentIndex(1)
+
+                # اگه حداقل ۲ انبار نیست
+                if len(rows) < 2:
+                    QMessageBox.warning(
+                        self, "توجه",
+                        "⚠️ برای انتقال، حداقل ۲ انبار نیازه!\n\n"
+                        "از دکمه «🏢 مدیریت انبارها» یه انبار جدید بساز."
+                    )
+        except Exception as e:
+            print(f"⚠️ خطا در load_warehouses: {e}")
+
+    def update_available_stock(self):
+        """بروزرسانی موجودی قابل انتقال — با غیرفعال کردن quantity در صورت صفر بودن"""
+        warehouse_id = self.from_warehouse.currentData()
+        if not warehouse_id:
+            self.available_stock_label.setText("موجودی قابل انتقال: ۰")
+            self.quantity.setEnabled(False)
+            return
+
+        try:
+            with get_db() as conn:
+                c = conn.cursor()
+                c.execute(
+                    "SELECT quantity FROM warehouse_stock "
+                    "WHERE product_id = ? AND warehouse_id = ?",
+                    [self.product['id'], warehouse_id]
+                )
                 row = c.fetchone()
-                stock = row[0] if row else 0
-                self.available_stock_label.setText(f"موجودی قابل انتقال: {stock:,.2f} {self.product.get('unit', 'عدد')}")
-                self.quantity.setMaximum(stock)
+                stock = float(row[0]) if row and row[0] else 0
+
+                self.available_stock_label.setText(
+                    f"موجودی قابل انتقال: {stock:,.2f} {self.product.get('unit', 'عدد')}"
+                )
+
+                # ✅ اگه موجودی صفره، quantity رو غیرفعال کن
+                if stock <= 0:
+                    self.quantity.setMaximum(0)
+                    self.quantity.setValue(0)
+                    self.quantity.setEnabled(False)
+                    self.available_stock_label.setStyleSheet(
+                        "font-weight: bold; color: #e84118; padding: 5px;"
+                    )
+                else:
+                    self.quantity.setEnabled(True)
+                    self.quantity.setMaximum(stock)
+                    if self.quantity.value() > stock or self.quantity.value() <= 0:
+                        self.quantity.setValue(min(1, stock))
+                    self.available_stock_label.setStyleSheet(
+                        "font-weight: bold; color: #273c75; padding: 5px;"
+                    )
+        except Exception as e:
+            print(f"⚠️ خطا در update_available_stock: {e}")
 
     def accept(self):
         from_warehouse_id = self.from_warehouse.currentData()
         to_warehouse_id = self.to_warehouse.currentData()
         quantity = self.quantity.value()
 
+        # ===== 🔍 دیباگ =====
+        print("=" * 50)
+        print(f"🔍 DEBUG انتقال:")
+        print(f"  product_id: {self.product.get('id')}")
+        print(f"  product_name: {self.product.get('name')}")
+        print(f"  from_warehouse_id: {from_warehouse_id}")
+        print(f"  to_warehouse_id: {to_warehouse_id}")
+        print(f"  quantity: {quantity}")
+        print("=" * 50)
+
+        # ===== اعتبارسنجی =====
         if not from_warehouse_id or not to_warehouse_id:
             QMessageBox.warning(self, "خطا", "لطفاً هر دو انبار را انتخاب کنید!")
             return
@@ -707,43 +799,84 @@ class StockTransferDialog(BaseDialog):
         if quantity <= 0:
             QMessageBox.warning(self, "خطا", "مقدار باید بیشتر از صفر باشد!")
             return
-        if quantity > self.quantity.maximum():
-            QMessageBox.warning(self, "خطا", f"موجودی کافی نیست! حداکثر قابل انتقال: {self.quantity.maximum():,.2f}")
-            return
 
-        with get_db() as conn:
-            c = conn.cursor()
+        try:
+            with get_db() as conn:
+                c = conn.cursor()
 
-            c.execute('''
-                UPDATE warehouse_stock SET quantity = quantity - ?, updated_at = CURRENT_TIMESTAMP
-                WHERE product_id = ? AND warehouse_id = ?
-            ''', [quantity, self.product['id'], from_warehouse_id])
+                # ✅ چک موجودی مبدا
+                c.execute(
+                    "SELECT quantity FROM warehouse_stock "
+                    "WHERE product_id = ? AND warehouse_id = ?",
+                    [self.product['id'], from_warehouse_id]
+                )
+                row = c.fetchone()
+                available = float(row[0]) if row and row[0] else 0
 
-            c.execute('''
-                INSERT INTO warehouse_stock (product_id, warehouse_id, quantity)
-                VALUES (?, ?, ?)
-                ON CONFLICT(product_id, warehouse_id) DO UPDATE SET
-                    quantity = quantity + ?,
-                    updated_at = CURRENT_TIMESTAMP
-            ''', [self.product['id'], to_warehouse_id, quantity, quantity])
+                if available <= 0:
+                    QMessageBox.warning(
+                        self, "خطا",
+                        "موجودی انبار مبدا صفره!"
+                    )
+                    return
 
-            c.execute('''
-                INSERT INTO stock_transactions (
-                    date, product_id, from_warehouse_id, to_warehouse_id,
-                    type, quantity, description
-                ) VALUES (?, ?, ?, ?, 'transfer', ?, ?)
-            ''', [
-                self.date.get_shamsi(), self.product['id'],
-                from_warehouse_id, to_warehouse_id, quantity,
-                self.description.toPlainText()
-            ])
+                if quantity > available:
+                    QMessageBox.warning(
+                        self, "خطا",
+                        f"موجودی کافی نیست!\n"
+                        f"موجودی فعلی: {available:,.2f}\n"
+                        f"درخواستی: {quantity:,.2f}"
+                    )
+                    return
 
-            c.execute("SELECT COALESCE(SUM(quantity), 0) FROM warehouse_stock WHERE product_id = ?", [self.product['id']])
-            total_stock = c.fetchone()[0] or 0
-            c.execute("UPDATE products SET stock = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", [total_stock, self.product['id']])
+                # ✅ ۱. کم کردن از مبدا (بدون منفی شدن)
+                c.execute('''
+                    UPDATE warehouse_stock 
+                    SET quantity = quantity - ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE product_id = ? AND warehouse_id = ?
+                ''', [quantity, self.product['id'], from_warehouse_id])
 
-            conn.commit()
-        super().accept()
+                # ✅ ۲. اضافه کردن به مقصد
+                c.execute('''
+                    INSERT INTO warehouse_stock (product_id, warehouse_id, quantity, updated_at)
+                    VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(product_id, warehouse_id) DO UPDATE SET
+                        quantity = quantity + ?,
+                        updated_at = CURRENT_TIMESTAMP
+                ''', [self.product['id'], to_warehouse_id, quantity, quantity])
+
+                # ✅ ۳. ثبت تراکنش
+                c.execute('''
+                    INSERT INTO stock_transactions (
+                        date, product_id, from_warehouse_id, to_warehouse_id,
+                        type, quantity, description
+                    ) VALUES (?, ?, ?, ?, 'transfer', ?, ?)
+                ''', [
+                    self.date.get_shamsi(), self.product['id'],
+                    from_warehouse_id, to_warehouse_id, quantity,
+                    self.description.toPlainText()
+                ])
+
+                # ✅ ۴. بروزرسانی موجودی کل محصول
+                c.execute(
+                    "SELECT COALESCE(SUM(quantity), 0) FROM warehouse_stock WHERE product_id = ?",
+                    [self.product['id']]
+                )
+                total_stock = c.fetchone()[0] or 0
+                c.execute(
+                    "UPDATE products SET stock = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    [total_stock, self.product['id']]
+                )
+
+                conn.commit()
+
+            print(f"✅ انتقال موفق: {quantity} از {from_warehouse_id} به {to_warehouse_id}")
+            super().accept()
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            QMessageBox.warning(self, "خطا", f"❌ خطا در انتقال: {e}")
 
 
 # ============================================================
@@ -757,6 +890,7 @@ class InventoryWidget(BaseWidget):
         self.user_level = user_level
         self.products_data = []
         self.current_product = None
+        self.warehouses = []
         self.valuation_method = self.get_valuation_method()
 
         self.setup_ui()
@@ -939,6 +1073,11 @@ class InventoryWidget(BaseWidget):
                 self.category_filter.addItem(cat['category'], cat['category'])
 
     def load_products(self):
+        """
+        ✅ رفع مشکل: 
+        - اگه فیلتر انبار فعال → موجودی همون انبار
+        - وگرنه → مجموع همه انبارها
+        """
         try:
             warehouse_id = self.warehouse_filter.currentData()
             category = self.category_filter.currentData()
@@ -946,19 +1085,33 @@ class InventoryWidget(BaseWidget):
 
             with get_db() as conn:
                 c = conn.cursor()
-                query = """
-                    SELECT p.*, w.name as warehouse_name,
-                           COALESCE(ws.quantity, 0) as current_stock
-                    FROM products p
-                    LEFT JOIN warehouses w ON p.warehouse_id = w.id
-                    LEFT JOIN warehouse_stock ws ON p.id = ws.product_id AND ws.warehouse_id = p.warehouse_id
-                    WHERE p.is_active = 1
-                """
-                params = []
-
+                
                 if warehouse_id:
-                    query += " AND p.warehouse_id = ?"
-                    params.append(warehouse_id)
+                    # ✅ حالت فیلتر انبار: فقط موجودی همون انبار
+                    query = """
+                        SELECT p.*, 
+                               w.name as warehouse_name,
+                               COALESCE(ws.quantity, 0) as current_stock,
+                               COALESCE(ws.quantity, 0) * COALESCE(p.purchase_price, 0) as stock_value
+                        FROM products p
+                        LEFT JOIN warehouses w ON w.id = ?
+                        LEFT JOIN warehouse_stock ws ON p.id = ws.product_id AND ws.warehouse_id = ?
+                        WHERE p.is_active = 1
+                    """
+                    params = [warehouse_id, warehouse_id]
+                else:
+                    # ✅ حالت همه انبارها: مجموع
+                    query = """
+                        SELECT p.*, 
+                               GROUP_CONCAT(w.name, ' + ') as warehouse_name,
+                               COALESCE(SUM(ws.quantity), 0) as current_stock,
+                               COALESCE(SUM(ws.quantity * COALESCE(p.purchase_price, 0)), 0) as stock_value
+                        FROM products p
+                        LEFT JOIN warehouse_stock ws ON p.id = ws.product_id
+                        LEFT JOIN warehouses w ON ws.warehouse_id = w.id
+                        WHERE p.is_active = 1
+                    """
+                    params = []
 
                 if category:
                     query += " AND p.category = ?"
@@ -967,12 +1120,15 @@ class InventoryWidget(BaseWidget):
                 if search:
                     query += " AND (p.code LIKE ? OR p.name LIKE ? OR p.brand LIKE ? OR p.model LIKE ? OR p.barcode LIKE ?)"
                     search_term = f"%{search}%"
-                    params.extend([search_term, search_term, search_term, search_term, search_term])
+                    params.extend([search_term] * 5)
+
+                if not warehouse_id:
+                    query += " GROUP BY p.id"
 
                 query += " ORDER BY p.code"
                 c.execute(query, params)
                 rows = c.fetchall()
-                
+
                 self.products_data = []
                 for row in rows:
                     self.products_data.append(dict(row))
@@ -982,6 +1138,8 @@ class InventoryWidget(BaseWidget):
 
         except Exception as e:
             print(f"⚠️ خطا در بارگذاری کالاها: {e}")
+            import traceback
+            traceback.print_exc()
             self.products_data = []
             self.display_products()
 
@@ -991,7 +1149,7 @@ class InventoryWidget(BaseWidget):
 
         for i, p in enumerate(self.products_data):
             stock = p.get('current_stock', p.get('stock', 0)) or 0
-            value = stock * (p.get('purchase_price', 0) or 0)
+            value = p.get('stock_value', stock * (p.get('purchase_price', 0) or 0))
             total_value += value
 
             self.products_table.setItem(i, 0, QTableWidgetItem(str(p.get('code', ''))))
@@ -1009,7 +1167,7 @@ class InventoryWidget(BaseWidget):
                 stock_item.setForeground(QColor('#e84118'))
             self.products_table.setItem(i, 8, stock_item)
 
-            self.products_table.setItem(i, 9, QTableWidgetItem(str(p.get('warehouse_name', '-'))))
+            self.products_table.setItem(i, 9, QTableWidgetItem(str(p.get('warehouse_name') or '-')))
 
             purchase_item = QTableWidgetItem(f"{p.get('purchase_price', 0):,.0f}")
             purchase_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
@@ -1077,16 +1235,58 @@ class InventoryWidget(BaseWidget):
         if row < 0:
             QMessageBox.warning(self, "خطا", "یک کالا را انتخاب کنید!")
             return
+
         product = self.products_data[row]
-        reply = QMessageBox.question(self, "تأیید حذف", f"آیا از حذف '{product['name']}' اطمینان دارید؟", QMessageBox.Yes | QMessageBox.No)
-        if reply == QMessageBox.Yes:
+
+        reply = QMessageBox.question(
+            self, "تأیید حذف",
+            f"آیا از حذف '{product['name']}' اطمینان دارید؟\n\n"
+            f"⚠️ این عمل قابل بازگشت نیست!",
+            QMessageBox.Yes | QMessageBox.No
+        )
+
+        if reply != QMessageBox.Yes:
+            return
+
+        try:
             with get_db() as conn:
                 c = conn.cursor()
+
+                # ✅ چک کن کجا استفاده شده
+                c.execute("SELECT COUNT(*) FROM stock_transactions WHERE product_id = ?", [product['id']])
+                trans_count = c.fetchone()[0]
+
+                c.execute("SELECT COUNT(*) FROM document_items WHERE product_id = ?", [product['id']])
+                doc_count = c.fetchone()[0]
+
+                if trans_count > 0 or doc_count > 0:
+                    reply2 = QMessageBox.question(
+                        self, "امکان حذف کامل نیست",
+                        f"⚠️ این کالا قابل حذف کامل نیست!\n\n"
+                        f"استفاده شده در:\n"
+                        f"• تراکنش‌های انبار: {trans_count:,}\n"
+                        f"• فاکتورها: {doc_count:,}\n\n"
+                        f"💡 راه‌حل: به جای حذف، غیرفعالش کن.\n\n"
+                        f"آیا می‌خواید غیرفعالش کنید؟",
+                        QMessageBox.Yes | QMessageBox.No
+                    )
+                    if reply2 == QMessageBox.Yes:
+                        c.execute("UPDATE products SET is_active = 0 WHERE id = ?", [product['id']])
+                        conn.commit()
+                        self.load_products()
+                        QMessageBox.information(self, "موفق", "✅ کالا غیرفعال شد!")
+                    return
+
+                # ✅ اگه استفاده نشده → حذف کامل
                 c.execute("DELETE FROM warehouse_stock WHERE product_id = ?", [product['id']])
                 c.execute("DELETE FROM products WHERE id = ?", [product['id']])
                 conn.commit()
+
             self.load_products()
             QMessageBox.information(self, "موفق", "✅ کالا حذف شد!")
+
+        except Exception as e:
+            QMessageBox.warning(self, "خطا", f"❌ خطا در حذف: {e}")
 
     def stock_transaction(self, trans_type):
         row = self.products_table.currentRow()
@@ -1129,7 +1329,7 @@ class InventoryWidget(BaseWidget):
                 writer.writerow(["کد", "نام", "دسته", "برند", "مدل", "سایز", "رنگ", "واحد", "موجودی", "انبار", "قیمت خرید", "قیمت فروش", "ارزش"])
                 for p in self.products_data:
                     stock = p.get('current_stock', p.get('stock', 0)) or 0
-                    value = stock * (p.get('purchase_price', 0) or 0)
+                    value = p.get('stock_value', stock * (p.get('purchase_price', 0) or 0))
                     writer.writerow([
                         p.get('code', ''),
                         p.get('name', ''),

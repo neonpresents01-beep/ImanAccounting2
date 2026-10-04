@@ -1,15 +1,12 @@
 # database.py
 # ============================================================
-# دیتابیس ImanAccount - نسخه v6.0 (Product-Ready + Moadian)
+# دیتابیس ImanAccount - نسخه v6.1 (Inventory Fix)
 # ============================================================
 #
-# تغییرات نسبت به v5.0:
-# ✅ افزودن جداول پلاگین مودیان (settings, invoices, logs, serial)
-# ✅ ۶ ایندکس جدید برای مودیان
-# ✅ بررسی نسخه SQLite (حداقل 3.24)
-# ✅ PRAGMA optimize قبل از بستن اتصال
-# ✅ استفاده از RETURNING در DocumentHelper
+# تغییرات نسبت به v6.0:
+# ✅ رفع باگ update_warehouse_stock.subtract
 # ✅ حفظ created_at در بروزرسانی‌ها
+# ✅ سایر موارد v6.0 حفظ شد
 # ============================================================
 
 import sqlite3
@@ -263,7 +260,6 @@ def get_db(timeout: float = 30.0):
         raise e
     finally:
         if conn:
-            # ✅ PRAGMA optimize قبل از بستن — بهینه‌سازی خودکار SQLite
             try:
                 conn.execute("PRAGMA optimize")
             except Exception:
@@ -287,7 +283,6 @@ class DatabaseManager:
     @staticmethod
     def init_db():
         """راه‌اندازی دیتابیس با تمام جداول، ایندکس‌ها و داده‌های اولیه"""
-        # ✅ بررسی نسخه SQLite
         check_sqlite_version()
 
         with get_db() as conn:
@@ -728,10 +723,9 @@ class DatabaseManager:
             ''')
 
             # ============================================================
-            # ✅ جداول پلاگین مودیان (جدید در v6.0)
+            # ✅ جداول پلاگین مودیان
             # ============================================================
 
-            # تنظیمات مودیان (رمزنگاری‌شده برای هر مشتری)
             c.execute('''
                 CREATE TABLE IF NOT EXISTS moadian_settings (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -746,7 +740,6 @@ class DatabaseManager:
                 )
             ''')
 
-            # صورتحساب‌های ارسالی به مودیان
             c.execute('''
                 CREATE TABLE IF NOT EXISTS moadian_invoices (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -764,7 +757,6 @@ class DatabaseManager:
                 )
             ''')
 
-            # لاگ درخواست‌های مودیان (برای دیباگ)
             c.execute('''
                 CREATE TABLE IF NOT EXISTS moadian_logs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -777,7 +769,6 @@ class DatabaseManager:
                 )
             ''')
 
-            # سریال یکتای هر مشتری برای تولید TaxID
             c.execute('''
                 CREATE TABLE IF NOT EXISTS moadian_serial (
                     customer_id TEXT PRIMARY KEY,
@@ -791,74 +782,43 @@ class DatabaseManager:
             # ============================================================
 
             indexes = [
-                # vouchers
                 "CREATE INDEX IF NOT EXISTS idx_vouchers_date ON vouchers(date)",
                 "CREATE INDEX IF NOT EXISTS idx_vouchers_type ON vouchers(type)",
                 "CREATE INDEX IF NOT EXISTS idx_vouchers_status ON vouchers(status)",
-
-                # voucher_items
                 "CREATE INDEX IF NOT EXISTS idx_voucher_items_voucher ON voucher_items(voucher_id)",
                 "CREATE INDEX IF NOT EXISTS idx_voucher_items_account ON voucher_items(account_code)",
-
-                # accounts
                 "CREATE INDEX IF NOT EXISTS idx_accounts_type ON accounts(type)",
                 "CREATE INDEX IF NOT EXISTS idx_accounts_parent ON accounts(parent_code)",
-
-                # products
                 "CREATE INDEX IF NOT EXISTS idx_products_code ON products(code)",
                 "CREATE INDEX IF NOT EXISTS idx_products_name ON products(name)",
                 "CREATE INDEX IF NOT EXISTS idx_products_category ON products(category)",
                 "CREATE INDEX IF NOT EXISTS idx_products_barcode ON products(barcode)",
                 "CREATE INDEX IF NOT EXISTS idx_products_warehouse ON products(warehouse_id)",
-
-                # warehouse_stock
                 "CREATE INDEX IF NOT EXISTS idx_warehouse_stock_product ON warehouse_stock(product_id)",
                 "CREATE INDEX IF NOT EXISTS idx_warehouse_stock_warehouse ON warehouse_stock(warehouse_id)",
-
-                # stock_transactions
                 "CREATE INDEX IF NOT EXISTS idx_stock_trans_date ON stock_transactions(date)",
                 "CREATE INDEX IF NOT EXISTS idx_stock_trans_product ON stock_transactions(product_id)",
                 "CREATE INDEX IF NOT EXISTS idx_stock_trans_type ON stock_transactions(type)",
-
-                # documents
                 "CREATE INDEX IF NOT EXISTS idx_documents_date ON documents(date)",
                 "CREATE INDEX IF NOT EXISTS idx_documents_type ON documents(doc_type)",
                 "CREATE INDEX IF NOT EXISTS idx_documents_party ON documents(party_id)",
-
-                # document_items
                 "CREATE INDEX IF NOT EXISTS idx_document_items_doc ON document_items(document_id)",
                 "CREATE INDEX IF NOT EXISTS idx_document_items_product ON document_items(product_id)",
-
-                # invoices
                 "CREATE INDEX IF NOT EXISTS idx_invoices_date ON invoices(date)",
                 "CREATE INDEX IF NOT EXISTS idx_invoices_party ON invoices(party_id)",
-
-                # purchase_orders
                 "CREATE INDEX IF NOT EXISTS idx_purchase_orders_date ON purchase_orders(date)",
                 "CREATE INDEX IF NOT EXISTS idx_purchase_orders_party ON purchase_orders(party_id)",
-
-                # payrolls
                 "CREATE INDEX IF NOT EXISTS idx_payrolls_employee ON payrolls(employee_id)",
                 "CREATE INDEX IF NOT EXISTS idx_payrolls_year_month ON payrolls(year, month)",
                 "CREATE INDEX IF NOT EXISTS idx_payrolls_status ON payrolls(payment_status)",
-
-                # employees
                 "CREATE INDEX IF NOT EXISTS idx_employees_code ON employees(code)",
                 "CREATE INDEX IF NOT EXISTS idx_employees_active ON employees(is_active)",
-
-                # parties
                 "CREATE INDEX IF NOT EXISTS idx_parties_type ON parties(type)",
                 "CREATE INDEX IF NOT EXISTS idx_parties_code ON parties(code)",
                 "CREATE INDEX IF NOT EXISTS idx_parties_name ON parties(name)",
-
-                # party_transactions
                 "CREATE INDEX IF NOT EXISTS idx_party_trans_party ON party_transactions(party_id)",
                 "CREATE INDEX IF NOT EXISTS idx_party_trans_date ON party_transactions(date)",
-
-                # users
                 "CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)",
-
-                # ✅ moadian indexes
                 "CREATE INDEX IF NOT EXISTS idx_moadian_inv_customer ON moadian_invoices(customer_id)",
                 "CREATE INDEX IF NOT EXISTS idx_moadian_inv_status ON moadian_invoices(status)",
                 "CREATE INDEX IF NOT EXISTS idx_moadian_inv_taxid ON moadian_invoices(taxid)",
@@ -959,10 +919,9 @@ class DatabaseManager:
 
             conn.commit()
 
-            print(f"✅ دیتابیس v6.0 آماده است - مسیر: {DB_NAME}")
+            print(f"✅ دیتابیس v6.1 آماده است - مسیر: {DB_NAME}")
             print(f"📅 سیستم تاریخ: {DateConverter.get_date_system()}")
             print(f"✅ {len(indexes)} ایندکس ایجاد/بررسی شد")
-            print(f"✅ جداول مودیان آماده است")
 
 
 # ============================================================
@@ -1085,6 +1044,15 @@ class InventoryHelper:
 
     @staticmethod
     def update_warehouse_stock(product_id: int, warehouse_id: int, quantity: float, operation: str = 'add'):
+        """
+        بروزرسانی موجودی انبار
+
+        Args:
+            product_id: شناسه محصول
+            warehouse_id: شناسه انبار
+            quantity: مقدار (همیشه مثبت)
+            operation: 'set' | 'add' | 'subtract'
+        """
         with get_db() as conn:
             c = conn.cursor()
             if operation == 'set':
@@ -1104,13 +1072,26 @@ class InventoryHelper:
                         updated_at = CURRENT_TIMESTAMP
                 ''', [product_id, warehouse_id, quantity, quantity])
             elif operation == 'subtract':
+                # ✅ رفع باگ: quantity مثبت، ولی تو VALUES مقدار اولیه 0 و بعد subtract
                 c.execute('''
                     INSERT INTO warehouse_stock (product_id, warehouse_id, quantity, updated_at)
-                    VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                    VALUES (?, ?, 0, CURRENT_TIMESTAMP)
                     ON CONFLICT(product_id, warehouse_id) DO UPDATE SET
-                        quantity = quantity - ?,
+                        quantity = MAX(0, quantity - ?),
                         updated_at = CURRENT_TIMESTAMP
-                ''', [product_id, warehouse_id, -quantity, quantity])
+                ''', [product_id, warehouse_id, quantity])
+
+    @staticmethod
+    def get_total_stock(product_id: int) -> float:
+        """مجموع موجودی محصول در همه انبارها"""
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute(
+                "SELECT COALESCE(SUM(quantity), 0) FROM warehouse_stock WHERE product_id = ?",
+                [product_id]
+            )
+            row = c.fetchone()
+            return float(row[0]) if row and row[0] else 0
 
 
 class ModuleLimitHelper:
@@ -1311,7 +1292,6 @@ class DocumentHelper:
             net_amount = total_amount - discount + tax
             db_date = DateConverter.for_db(date)
 
-            # ✅ استفاده از RETURNING برای دریافت id در همان کوئری
             c.execute('''
                 INSERT INTO documents
                 (doc_no, doc_type, date, party_id, total_amount, discount, tax, net_amount, description)
@@ -1401,15 +1381,8 @@ if __name__ == "__main__":
     print(f"📦 نسخه SQLite: {sqlite3.sqlite_version}")
     DatabaseManager.init_db()
     print("\n" + "=" * 60)
-    print("✅ دیتابیس ImanAccount v6.0 ساخته شد!")
+    print("✅ دیتابیس ImanAccount v6.1 ساخته شد!")
     print("=" * 60)
     print(f"📁 مسیر: {DB_NAME}")
     print(f"📅 سیستم تاریخ: {DateConverter.get_date_system()}")
-    print("\n✅ تغییرات نسبت به v5.0:")
-    print("   • افزودن ۴ جدول مودیان")
-    print("   • افزودن ۶ ایندکس مودیان")
-    print("   • بررسی نسخه SQLite (حداقل 3.24)")
-    print("   • PRAGMA optimize قبل از بستن")
-    print("   • استفاده از RETURNING در DocumentHelper")
-    print("   • حفظ created_at در بروزرسانی‌ها")
     print("=" * 60)
