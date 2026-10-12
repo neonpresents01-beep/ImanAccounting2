@@ -1,0 +1,12 @@
+2026-05-10 22:00:14,143 - INFO - ============================================================
+2026-05-10 22:00:14,148 - INFO - سیستم حسابداری پارسه - شروع اجرا
+2026-05-10 22:00:14,148 - INFO - مسیر نصب: .
+2026-05-10 22:00:14,148 - INFO - ============================================================
+2026-05-10 22:00:18,088 - INFO - ✅ لایسنس معتبر است
+2026-05-10 22:00:18,088 - INFO -    مشتری: نسخه آزمایشی
+2026-05-10 22:00:18,088 - INFO -    ماژول‌ها: ['accounting', 'inventory', 'payroll', 'ai', 'reports', 'plugin']
+2026-05-10 22:00:18,088 - INFO -    روزهای باقیمانده: 29
+2026-05-10 22:00:18,963 - INFO - ✅ دیتابیس راه‌اندازی شد
+2026-05-10 22:00:21,876 - INFO - Imported existing <module 'comtypes.gen' from 'C:\\Users\\Iman\\AppData\\Local\\Programs\\Python\\Python38-32\\lib\\site-packages\\comtypes\\gen\\__init__.py'>
+2026-05-10 22:00:21,880 - INFO - Using writeable comtypes cache directory: 'C:\Users\Iman\AppData\Local\Programs\Python\Python38-32\lib\site-packages\comtypes\gen'
+2026-05-10 22:00:26,552 - INFO - ✅ برنامه با موفقیت راه‌اندازی شد

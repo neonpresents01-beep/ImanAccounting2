@@ -1,0 +1,32 @@
+[
+  {
+    "description": "تست",
+    "account_code": "1102",
+    "class": 1
+  },
+  {
+    "description": "فروش کالا فروش کالا",
+    "account_code": "1101",
+    "class": 0
+  },
+  {
+    "description": "فروش کالا بصورت نقد",
+    "account_code": "1102",
+    "class": 1
+  },
+  {
+    "description": "fgdv",
+    "account_code": "5101",
+    "class": 9
+  },
+  {
+    "description": "بابت پرداخت بدهی",
+    "account_code": "1102",
+    "class": 1
+  },
+  {
+    "description": "eifcec",
+    "account_code": "2101",
+    "class": 4
+  }
+]

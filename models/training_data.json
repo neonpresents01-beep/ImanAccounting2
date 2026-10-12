@@ -1,0 +1,12 @@
+[
+  {
+    "description": "تست",
+    "account_code": "1102",
+    "class": 1
+  },
+  {
+    "description": "فروش کالا فروش کالا",
+    "account_code": "1101",
+    "class": 0
+  }
+]

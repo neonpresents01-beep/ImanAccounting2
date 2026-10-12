@@ -1,55 +1,7 @@
-# Python
 __pycache__/
-*.py[cod]
+*.pyc
 build/
 dist/
-dist_final/
-dist_obf/
 *.spec
-installer_output/
-
-# Database
-*.db
-
-# Logs
-*.log
-logs/
-
-# Keys
-license.key
-*.key
-private_key.pem
-trial_used.dat
-trial.license
-trial_certificate.bin
-
-# AI
-*.pkl
-*.h5
-models/
-
-# Outputs
-*.pdf
-*.csv
-SAL*.pdf
-PUR*.pdf
-
-# Backups
-*.bak
-*.backup
-
-# Test
-test.py
-test2.py
-fix_mainwindow.py
-
-# Env
-.env
-
-# IDE
-.vscode/
 .idea/
-
-# OS
-Thumbs.db
-.DS_Store
+.vscode/

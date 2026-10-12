@@ -1,0 +1,19 @@
+Traceback (most recent call last):
+  File "main.py", line 505, in _set_app_icon
+    print(f"\u2705 \u0622\u06cc\u06a9\u0648\u0646 \u0628\u0631\u0646\u0627\u0645\u0647 \u0627\u0632 {path} \u0628\u0627\u0631\u06af\u0630\u0627\u0631\u06cc \u0634\u062f")
+  File "C:\Users\Iman\AppData\Local\Programs\Python\Python38-32\lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+UnicodeEncodeError: 'charmap' codec can't encode character '\u2705' in position 0: character maps to <undefined>
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "main.py", line 732, in <module>
+    app.run()
+  File "main.py", line 480, in run
+    self._set_app_icon()
+  File "main.py", line 508, in _set_app_icon
+    print(f"\u26a0\ufe0f \u062e\u0637\u0627 \u062f\u0631 \u0628\u0627\u0631\u06af\u0630\u0627\u0631\u06cc \u0622\u06cc\u06a9\u0648\u0646: {e}")
+  File "C:\Users\Iman\AppData\Local\Programs\Python\Python38-32\lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+UnicodeEncodeError: 'charmap' codec can't encode characters in position 0-1: character maps to <undefined>
