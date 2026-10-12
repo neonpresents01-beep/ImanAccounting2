@@ -1,17 +1,27 @@
 # ui/inventory_widget.py
 # ============================================================
-# ویجت انبارداری پیشرفته ImanAccount
-# نسخه کامل با رفع تمام خطاها + رفع مشکل انتقال انبار
+# ویجت انبارداری پیشرفته ImanAccount — نسخه 10.0
+# ============================================================
+# تغییرات نسبت به v9.0:
+# ✅ اضافه شدن انبارگردانی (Inventory Count)
+# ✅ InventoryCountListDialog — لیست اسناد
+# ✅ InventoryCountDialog — ایجاد/ویرایش سند
+# ✅ چاپ برگه انبارگردانی
+# ✅ تأیید سند و اصلاح خودکار موجودی
 # ============================================================
 
 from PyQt5.QtWidgets import *
 from PyQt5.QtCore import *
 from PyQt5.QtGui import *
+from PyQt5.QtPrintSupport import QPrinter, QPrintPreviewDialog
 from ui.base_widgets import BaseWidget, BaseDialog
-from database import get_db
-from shamsi_date import ShamsiDateEdit, safe_display_date, get_today_jalali
+from database import get_db, InventoryHelper, safe_display_date, get_today_jalali
+from shamsi_date import ShamsiDateEdit
 import csv
+import logging
 from datetime import datetime
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================
@@ -309,6 +319,14 @@ class ProductDialog(BaseDialog):
         self.max_stock.setStyleSheet("padding: 8px; border: 1px solid #ddd; border-radius: 4px;")
         price_layout.addRow("📈 حداکثر موجودی:", self.max_stock)
 
+        # ✅ موجودی اولیه (فقط برای کالای جدید)
+        self.initial_stock = QDoubleSpinBox()
+        self.initial_stock.setRange(0, 999999)
+        self.initial_stock.setDecimals(2)
+        self.initial_stock.setStyleSheet("padding: 8px; border: 2px solid #1976D2; border-radius: 4px;")
+        self.initial_stock.setToolTip("فقط برای کالای جدید — موجودی اولیه انبار")
+        price_layout.addRow("📦 موجودی اولیه:", self.initial_stock)
+
         self.warehouse_combo = QComboBox()
         self.warehouse_combo.setStyleSheet("padding: 8px; border: 1px solid #ddd; border-radius: 4px;")
         self.load_warehouses()
@@ -367,6 +385,12 @@ class ProductDialog(BaseDialog):
                 self.sale_price.setValue(row['sale_price'] or 0)
                 self.min_stock.setValue(row['min_stock'] or 0)
                 self.max_stock.setValue(row['max_stock'] or 0)
+                
+                # ✅ در حالت ویرایش، فیلد موجودی اولیه غیرفعال
+                self.initial_stock.setEnabled(False)
+                self.initial_stock.setValue(0)
+                self.initial_stock.setStyleSheet("padding: 8px; border: 1px solid #ddd; background: #f0f0f0; border-radius: 4px;")
+                
                 if row['warehouse_id']:
                     idx = self.warehouse_combo.findData(row['warehouse_id'])
                     if idx >= 0:
@@ -394,47 +418,107 @@ class ProductDialog(BaseDialog):
         if not code:
             code = self.get_next_code()
 
-        with get_db() as conn:
-            c = conn.cursor()
-            if self.product_id:
-                c.execute('''
-                    UPDATE products SET
-                        code=?, name=?, category=?, unit=?, brand=?, model=?,
-                        color=?, size=?, weight=?, barcode=?, has_serial=?,
-                        expiry_date=?, location=?, purchase_price=?, sale_price=?,
-                        min_stock=?, max_stock=?, warehouse_id=?, updated_at=CURRENT_TIMESTAMP
-                    WHERE id=?
-                ''', [
-                    code, self.name.text().strip(), self.category.currentText(),
-                    self.unit.currentText(), self.brand.text().strip(),
-                    self.model.text().strip(), self.color.text().strip(),
-                    self.size.text().strip(), self.weight.value(),
-                    self.barcode.text().strip(), 1 if self.has_serial.isChecked() else 0,
-                    self.expiry_date.get_shamsi(), self.location.text().strip(),
-                    self.purchase_price.value(), self.sale_price.value(),
-                    self.min_stock.value(), self.max_stock.value(),
-                    self.warehouse_combo.currentData(), self.product_id
-                ])
-            else:
-                c.execute('''
-                    INSERT INTO products (
-                        code, name, category, unit, brand, model, color, size,
-                        weight, barcode, has_serial, expiry_date, location,
-                        purchase_price, sale_price, min_stock, max_stock, warehouse_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''', [
-                    code, self.name.text().strip(), self.category.currentText(),
-                    self.unit.currentText(), self.brand.text().strip(),
-                    self.model.text().strip(), self.color.text().strip(),
-                    self.size.text().strip(), self.weight.value(),
-                    self.barcode.text().strip(), 1 if self.has_serial.isChecked() else 0,
-                    self.expiry_date.get_shamsi(), self.location.text().strip(),
-                    self.purchase_price.value(), self.sale_price.value(),
-                    self.min_stock.value(), self.max_stock.value(),
-                    self.warehouse_combo.currentData()
-                ])
-            conn.commit()
-        super().accept()
+        warehouse_id = self.warehouse_combo.currentData()
+        
+        # ✅ اگر کالای جدید و انبار انتخاب نشده، از انبار پیش‌فرض استفاده کن
+        if not self.product_id and not warehouse_id:
+            with get_db() as conn:
+                c = conn.cursor()
+                c.execute("SELECT id FROM warehouses WHERE is_default = 1 AND is_active = 1 LIMIT 1")
+                row = c.fetchone()
+                if row:
+                    warehouse_id = row['id']
+                else:
+                    c.execute("SELECT id FROM warehouses WHERE is_active = 1 ORDER BY id LIMIT 1")
+                    row = c.fetchone()
+                    if row:
+                        warehouse_id = row['id']
+
+        try:
+            with get_db() as conn:
+                c = conn.cursor()
+                
+                if self.product_id:
+                    # ─── ویرایش ───
+                    c.execute('''
+                        UPDATE products SET
+                            code=?, name=?, category=?, unit=?, brand=?, model=?,
+                            color=?, size=?, weight=?, barcode=?, has_serial=?,
+                            expiry_date=?, location=?, purchase_price=?, sale_price=?,
+                            min_stock=?, max_stock=?, warehouse_id=?, updated_at=CURRENT_TIMESTAMP
+                        WHERE id=?
+                    ''', [
+                        code, self.name.text().strip(), self.category.currentText(),
+                        self.unit.currentText(), self.brand.text().strip(),
+                        self.model.text().strip(), self.color.text().strip(),
+                        self.size.text().strip(), self.weight.value(),
+                        self.barcode.text().strip(), 1 if self.has_serial.isChecked() else 0,
+                        self.expiry_date.get_shamsi(), self.location.text().strip(),
+                        self.purchase_price.value(), self.sale_price.value(),
+                        self.min_stock.value(), self.max_stock.value(),
+                        warehouse_id, self.product_id
+                    ])
+                    
+                    # ✅ همگام‌سازی
+                    InventoryHelper.sync_product_stock(self.product_id, conn=conn)
+                    
+                else:
+                    # ─── ایجاد جدید ───
+                    c.execute('''
+                        INSERT INTO products (
+                            code, name, category, unit, brand, model, color, size,
+                            weight, barcode, has_serial, expiry_date, location,
+                            purchase_price, sale_price, min_stock, max_stock, 
+                            warehouse_id, stock
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', [
+                        code, self.name.text().strip(), self.category.currentText(),
+                        self.unit.currentText(), self.brand.text().strip(),
+                        self.model.text().strip(), self.color.text().strip(),
+                        self.size.text().strip(), self.weight.value(),
+                        self.barcode.text().strip(), 1 if self.has_serial.isChecked() else 0,
+                        self.expiry_date.get_shamsi(), self.location.text().strip(),
+                        self.purchase_price.value(), self.sale_price.value(),
+                        self.min_stock.value(), self.max_stock.value(),
+                        warehouse_id, 0  # stock موقتاً صفر
+                    ])
+                    
+                    product_id = c.lastrowid
+                    
+                    # ✅ اگر موجودی اولیه وارد شده، رکورد warehouse_stock بساز
+                    initial_stock = self.initial_stock.value()
+                    if initial_stock > 0 and warehouse_id:
+                        c.execute('''
+                            INSERT INTO warehouse_stock 
+                            (product_id, warehouse_id, quantity, updated_at)
+                            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                        ''', [product_id, warehouse_id, initial_stock])
+                        
+                        # ✅ ثبت تراکنش موجودی اولیه
+                        c.execute('''
+                            INSERT INTO stock_transactions
+                            (date, product_id, warehouse_id, type, quantity,
+                             unit_price, total_price, description)
+                            VALUES (?, ?, ?, 'in', ?, ?, ?, ?)
+                        ''', [
+                            get_today_jalali(), product_id, warehouse_id,
+                            initial_stock,
+                            self.purchase_price.value(),
+                            initial_stock * self.purchase_price.value(),
+                            'موجودی اولیه'
+                        ])
+                    
+                    # ✅ همگام‌سازی نهایی
+                    InventoryHelper.sync_product_stock(product_id, conn=conn)
+                
+                conn.commit()
+            
+            super().accept()
+            
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            QMessageBox.warning(self, "خطا", f"❌ خطا در ذخیره: {e}")
 
 
 # ============================================================
@@ -550,37 +634,37 @@ class StockTransactionDialog(BaseDialog):
         if self.unit_price.value() == 0:
             QMessageBox.warning(self, "خطا", "قیمت واحد باید بیشتر از صفر باشد!")
             return
-        if self.trans_type == 'out' and self.quantity.value() > self.product.get('stock', 0):
-            QMessageBox.warning(self, "خطا", f"موجودی کافی نیست! موجودی: {self.product.get('stock', 0):,.2f}")
-            return
-
+        
         warehouse_id = self.warehouse_combo.currentData()
         if not warehouse_id:
             QMessageBox.warning(self, "خطا", "لطفاً انبار را انتخاب کنید!")
             return
 
+        # ✅ چک موجودی از warehouse_stock
+        if self.trans_type == 'out':
+            available = InventoryHelper.get_stock(self.product['id'], warehouse_id)
+            if self.quantity.value() > available:
+                QMessageBox.warning(
+                    self, "خطا",
+                    f"موجودی انبار کافی نیست!\n"
+                    f"موجودی این انبار: {available:,.2f}"
+                )
+                return
+
         try:
             with get_db() as conn:
                 c = conn.cursor()
-
-                if self.trans_type == 'in':
-                    # ✅ افزودن به انبار
-                    c.execute('''
-                        INSERT INTO warehouse_stock (product_id, warehouse_id, quantity, updated_at)
-                        VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-                        ON CONFLICT(product_id, warehouse_id) DO UPDATE SET
-                            quantity = quantity + ?,
-                            updated_at = CURRENT_TIMESTAMP
-                    ''', [self.product['id'], warehouse_id, self.quantity.value(), self.quantity.value()])
-                else:
-                    # ✅ کم کردن از انبار
-                    c.execute('''
-                        UPDATE warehouse_stock 
-                        SET quantity = MAX(0, quantity - ?), updated_at = CURRENT_TIMESTAMP
-                        WHERE product_id = ? AND warehouse_id = ?
-                    ''', [self.quantity.value(), self.product['id'], warehouse_id])
-
-                # ✅ ثبت تراکنش
+                
+                # ✅ ۱. به‌روزرسانی موجودی با تابع مرکزی
+                InventoryHelper.adjust_stock(
+                    self.product['id'],
+                    self.quantity.value(),
+                    self.trans_type,
+                    warehouse_id=warehouse_id,
+                    conn=conn
+                )
+                
+                # ✅ ۲. ثبت تراکنش
                 c.execute('''
                     INSERT INTO stock_transactions (
                         date, product_id, warehouse_id, type, quantity,
@@ -593,19 +677,9 @@ class StockTransactionDialog(BaseDialog):
                     self.ref_no.text(), self.description.toPlainText(),
                     self.serial_numbers.toPlainText()
                 ])
-
-                # ✅ بروزرسانی موجودی کل محصول
-                c.execute(
-                    "SELECT COALESCE(SUM(quantity), 0) FROM warehouse_stock WHERE product_id = ?",
-                    [self.product['id']]
-                )
-                total_stock = c.fetchone()[0] or 0
-                c.execute(
-                    "UPDATE products SET stock = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                    [total_stock, self.product['id']]
-                )
-
+                
                 conn.commit()
+            
             super().accept()
 
         except Exception as e:
@@ -616,7 +690,6 @@ class StockTransactionDialog(BaseDialog):
 
 # ============================================================
 # دیالوگ انتقال بین انبارها
-# ✅ رفع خطای ۲ + رفع مشکل انتقال
 # ============================================================
 
 class StockTransferDialog(BaseDialog):
@@ -637,7 +710,6 @@ class StockTransferDialog(BaseDialog):
         title.setAlignment(Qt.AlignCenter)
         layout.addRow(title)
 
-        # ✅ اول from_warehouse رو بساز
         self.from_warehouse = QComboBox()
         self.from_warehouse.currentIndexChanged.connect(self.update_available_stock)
         layout.addRow("🏢 انبار مبدا:", self.from_warehouse)
@@ -646,11 +718,9 @@ class StockTransferDialog(BaseDialog):
         self.available_stock_label.setStyleSheet("font-weight: bold; color: #273c75; padding: 5px;")
         layout.addRow(self.available_stock_label)
 
-        # ✅ بعد to_warehouse رو بساز
         self.to_warehouse = QComboBox()
         layout.addRow("🏢 انبار مقصد:", self.to_warehouse)
 
-        # ✅ حالا که هر دو ساخته شدن، load_warehouses رو صدا بزن
         self.load_warehouses()
 
         line = QFrame()
@@ -687,11 +757,9 @@ class StockTransferDialog(BaseDialog):
 
         layout.addRow(btn_widget)
 
-        # ✅ بروزرسانی موجودی اولیه
         self.update_available_stock()
 
     def load_warehouses(self):
-        """بارگذاری لیست انبارها با چک ایمن برای هر دو combo"""
         try:
             with get_db() as conn:
                 c = conn.cursor()
@@ -701,7 +769,6 @@ class StockTransferDialog(BaseDialog):
                 )
                 rows = c.fetchall()
 
-                # ✅ چک from_warehouse
                 if hasattr(self, 'from_warehouse') and self.from_warehouse is not None:
                     self.from_warehouse.blockSignals(True)
                     self.from_warehouse.clear()
@@ -711,18 +778,15 @@ class StockTransferDialog(BaseDialog):
                         )
                     self.from_warehouse.blockSignals(False)
 
-                # ✅ چک to_warehouse
                 if hasattr(self, 'to_warehouse') and self.to_warehouse is not None:
                     self.to_warehouse.clear()
                     for row in rows:
                         self.to_warehouse.addItem(
                             f"{row['code']} - {row['name']}", row['id']
                         )
-                    # ✅ اگه بیش از ۱ انبار، دومی رو انتخاب کن به عنوان پیش‌فرض مقصد
                     if len(rows) >= 2:
                         self.to_warehouse.setCurrentIndex(1)
 
-                # اگه حداقل ۲ انبار نیست
                 if len(rows) < 2:
                     QMessageBox.warning(
                         self, "توجه",
@@ -733,7 +797,6 @@ class StockTransferDialog(BaseDialog):
             print(f"⚠️ خطا در load_warehouses: {e}")
 
     def update_available_stock(self):
-        """بروزرسانی موجودی قابل انتقال — با غیرفعال کردن quantity در صورت صفر بودن"""
         warehouse_id = self.from_warehouse.currentData()
         if not warehouse_id:
             self.available_stock_label.setText("موجودی قابل انتقال: ۰")
@@ -741,36 +804,27 @@ class StockTransferDialog(BaseDialog):
             return
 
         try:
-            with get_db() as conn:
-                c = conn.cursor()
-                c.execute(
-                    "SELECT quantity FROM warehouse_stock "
-                    "WHERE product_id = ? AND warehouse_id = ?",
-                    [self.product['id'], warehouse_id]
-                )
-                row = c.fetchone()
-                stock = float(row[0]) if row and row[0] else 0
+            stock = InventoryHelper.get_stock(self.product['id'], warehouse_id)
 
-                self.available_stock_label.setText(
-                    f"موجودی قابل انتقال: {stock:,.2f} {self.product.get('unit', 'عدد')}"
-                )
+            self.available_stock_label.setText(
+                f"موجودی قابل انتقال: {stock:,.2f} {self.product.get('unit', 'عدد')}"
+            )
 
-                # ✅ اگه موجودی صفره، quantity رو غیرفعال کن
-                if stock <= 0:
-                    self.quantity.setMaximum(0)
-                    self.quantity.setValue(0)
-                    self.quantity.setEnabled(False)
-                    self.available_stock_label.setStyleSheet(
-                        "font-weight: bold; color: #e84118; padding: 5px;"
-                    )
-                else:
-                    self.quantity.setEnabled(True)
-                    self.quantity.setMaximum(stock)
-                    if self.quantity.value() > stock or self.quantity.value() <= 0:
-                        self.quantity.setValue(min(1, stock))
-                    self.available_stock_label.setStyleSheet(
-                        "font-weight: bold; color: #273c75; padding: 5px;"
-                    )
+            if stock <= 0:
+                self.quantity.setMaximum(0)
+                self.quantity.setValue(0)
+                self.quantity.setEnabled(False)
+                self.available_stock_label.setStyleSheet(
+                    "font-weight: bold; color: #e84118; padding: 5px;"
+                )
+            else:
+                self.quantity.setEnabled(True)
+                self.quantity.setMaximum(stock)
+                if self.quantity.value() > stock or self.quantity.value() <= 0:
+                    self.quantity.setValue(min(1, stock))
+                self.available_stock_label.setStyleSheet(
+                    "font-weight: bold; color: #273c75; padding: 5px;"
+                )
         except Exception as e:
             print(f"⚠️ خطا در update_available_stock: {e}")
 
@@ -779,17 +833,6 @@ class StockTransferDialog(BaseDialog):
         to_warehouse_id = self.to_warehouse.currentData()
         quantity = self.quantity.value()
 
-        # ===== 🔍 دیباگ =====
-        print("=" * 50)
-        print(f"🔍 DEBUG انتقال:")
-        print(f"  product_id: {self.product.get('id')}")
-        print(f"  product_name: {self.product.get('name')}")
-        print(f"  from_warehouse_id: {from_warehouse_id}")
-        print(f"  to_warehouse_id: {to_warehouse_id}")
-        print(f"  quantity: {quantity}")
-        print("=" * 50)
-
-        # ===== اعتبارسنجی =====
         if not from_warehouse_id or not to_warehouse_id:
             QMessageBox.warning(self, "خطا", "لطفاً هر دو انبار را انتخاب کنید!")
             return
@@ -804,20 +847,10 @@ class StockTransferDialog(BaseDialog):
             with get_db() as conn:
                 c = conn.cursor()
 
-                # ✅ چک موجودی مبدا
-                c.execute(
-                    "SELECT quantity FROM warehouse_stock "
-                    "WHERE product_id = ? AND warehouse_id = ?",
-                    [self.product['id'], from_warehouse_id]
-                )
-                row = c.fetchone()
-                available = float(row[0]) if row and row[0] else 0
+                available = InventoryHelper.get_stock(self.product['id'], from_warehouse_id)
 
                 if available <= 0:
-                    QMessageBox.warning(
-                        self, "خطا",
-                        "موجودی انبار مبدا صفره!"
-                    )
+                    QMessageBox.warning(self, "خطا", "موجودی انبار مبدا صفره!")
                     return
 
                 if quantity > available:
@@ -829,23 +862,18 @@ class StockTransferDialog(BaseDialog):
                     )
                     return
 
-                # ✅ ۱. کم کردن از مبدا (بدون منفی شدن)
-                c.execute('''
-                    UPDATE warehouse_stock 
-                    SET quantity = quantity - ?, updated_at = CURRENT_TIMESTAMP
-                    WHERE product_id = ? AND warehouse_id = ?
-                ''', [quantity, self.product['id'], from_warehouse_id])
+                # ✅ استفاده از تابع مرکزی
+                InventoryHelper.adjust_stock(
+                    self.product['id'], quantity, 'out',
+                    warehouse_id=from_warehouse_id, conn=conn
+                )
+                
+                InventoryHelper.adjust_stock(
+                    self.product['id'], quantity, 'in',
+                    warehouse_id=to_warehouse_id, conn=conn
+                )
 
-                # ✅ ۲. اضافه کردن به مقصد
-                c.execute('''
-                    INSERT INTO warehouse_stock (product_id, warehouse_id, quantity, updated_at)
-                    VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-                    ON CONFLICT(product_id, warehouse_id) DO UPDATE SET
-                        quantity = quantity + ?,
-                        updated_at = CURRENT_TIMESTAMP
-                ''', [self.product['id'], to_warehouse_id, quantity, quantity])
-
-                # ✅ ۳. ثبت تراکنش
+                # ثبت تراکنش
                 c.execute('''
                     INSERT INTO stock_transactions (
                         date, product_id, from_warehouse_id, to_warehouse_id,
@@ -857,17 +885,6 @@ class StockTransferDialog(BaseDialog):
                     self.description.toPlainText()
                 ])
 
-                # ✅ ۴. بروزرسانی موجودی کل محصول
-                c.execute(
-                    "SELECT COALESCE(SUM(quantity), 0) FROM warehouse_stock WHERE product_id = ?",
-                    [self.product['id']]
-                )
-                total_stock = c.fetchone()[0] or 0
-                c.execute(
-                    "UPDATE products SET stock = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                    [total_stock, self.product['id']]
-                )
-
                 conn.commit()
 
             print(f"✅ انتقال موفق: {quantity} از {from_warehouse_id} به {to_warehouse_id}")
@@ -877,6 +894,1436 @@ class StockTransferDialog(BaseDialog):
             import traceback
             traceback.print_exc()
             QMessageBox.warning(self, "خطا", f"❌ خطا در انتقال: {e}")
+# ============================================================
+# دیالوگ لیست اسناد انبارگردانی
+# ============================================================
+
+class InventoryCountListDialog(BaseDialog):
+    """دیالوگ لیست اسناد انبارگردانی"""
+    
+    def __init__(self, parent=None):
+        super().__init__(parent, base_width=1100, base_height=700)
+        self.setWindowTitle("📋 اسناد انبارگردانی")
+        self.setModal(True)
+        self.setup_ui()
+        self.load_data()
+        self.apply_theme()
+    
+    def setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+        layout.setContentsMargins(15, 15, 15, 15)
+        
+        # ─── هدر ───
+        header = QHBoxLayout()
+        
+        title = QLabel("📋 اسناد انبارگردانی")
+        title.setStyleSheet("font-size: 16pt; font-weight: bold; color: #273c75;")
+        header.addWidget(title)
+        
+        header.addStretch()
+        
+        # فیلتر انبار
+        header.addWidget(QLabel("انبار:"))
+        self.warehouse_filter = QComboBox()
+        self.warehouse_filter.addItem("همه انبارها", "")
+        self.load_warehouses()
+        self.warehouse_filter.currentIndexChanged.connect(self.load_data)
+        self.warehouse_filter.setMinimumWidth(150)
+        header.addWidget(self.warehouse_filter)
+        
+        # فیلتر وضعیت
+        header.addWidget(QLabel("وضعیت:"))
+        self.status_filter = QComboBox()
+        self.status_filter.addItem("همه", "")
+        self.status_filter.addItem("📝 پیش‌نویس", "draft")
+        self.status_filter.addItem("✅ تأیید شده", "approved")
+        self.status_filter.addItem("❌ لغو شده", "cancelled")
+        self.status_filter.currentIndexChanged.connect(self.load_data)
+        header.addWidget(self.status_filter)
+        
+        layout.addLayout(header)
+        
+        # ─── نوار ابزار ───
+        toolbar = QHBoxLayout()
+        
+        new_btn = QPushButton("➕ سند جدید")
+        new_btn.setStyleSheet("""
+            QPushButton {
+                background: #4CAF50; color: white; padding: 10px 20px;
+                border: none; border-radius: 6px; font-weight: bold;
+            }
+            QPushButton:hover { background: #388E3C; }
+        """)
+        new_btn.clicked.connect(self.new_count)
+        toolbar.addWidget(new_btn)
+        
+        open_btn = QPushButton("👁️ مشاهده/ویرایش")
+        open_btn.setStyleSheet("""
+            QPushButton {
+                background: #FF9800; color: white; padding: 10px 20px;
+                border: none; border-radius: 6px; font-weight: bold;
+            }
+            QPushButton:hover { background: #E68900; }
+        """)
+        open_btn.clicked.connect(self.open_count)
+        toolbar.addWidget(open_btn)
+        
+        delete_btn = QPushButton("🗑️ حذف")
+        delete_btn.setStyleSheet("""
+            QPushButton {
+                background: #e74c3c; color: white; padding: 10px 20px;
+                border: none; border-radius: 6px; font-weight: bold;
+            }
+            QPushButton:hover { background: #c0392b; }
+        """)
+        delete_btn.clicked.connect(self.delete_count)
+        toolbar.addWidget(delete_btn)
+        
+        toolbar.addStretch()
+        
+        refresh_btn = QPushButton("🔄 بروزرسانی")
+        refresh_btn.setStyleSheet("""
+            QPushButton {
+                background: #3498db; color: white; padding: 10px 20px;
+                border: none; border-radius: 6px; font-weight: bold;
+            }
+            QPushButton:hover { background: #2980b9; }
+        """)
+        refresh_btn.clicked.connect(self.load_data)
+        toolbar.addWidget(refresh_btn)
+        
+        layout.addLayout(toolbar)
+        
+        # ─── جدول ───
+        self.table = QTableWidget()
+        self.table.setColumnCount(8)
+        self.table.setHorizontalHeaderLabels([
+            "شماره", "تاریخ", "انبار", "تعداد اقلام",
+            "اقلام مغایرت‌دار", "ارزش مغایرت", "وضعیت", "ایجادکننده"
+        ])
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setAlternatingRowColors(True)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.setColumnWidth(0, 120)
+        self.table.setColumnWidth(1, 100)
+        self.table.setColumnWidth(2, 180)
+        self.table.setColumnWidth(3, 100)
+        self.table.setColumnWidth(4, 120)
+        self.table.setColumnWidth(5, 130)
+        self.table.setColumnWidth(6, 120)
+        self.table.doubleClicked.connect(self.open_count)
+        layout.addWidget(self.table)
+        
+        # ─── خلاصه ───
+        self.summary_label = QLabel("📊 در حال بارگذاری...")
+        self.summary_label.setStyleSheet("""
+            background: #f0f0f0; padding: 10px; border-radius: 6px;
+            font-weight: bold; color: #2c3e50;
+        """)
+        layout.addWidget(self.summary_label)
+        
+        # ─── دکمه بستن ───
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        close_btn = QPushButton("❌ بستن")
+        close_btn.setMinimumWidth(120)
+        close_btn.setStyleSheet("""
+            QPushButton {
+                background: #95a5a6; color: white; padding: 10px 20px;
+                border: none; border-radius: 6px; font-weight: bold;
+            }
+            QPushButton:hover { background: #7f8c8d; }
+        """)
+        close_btn.clicked.connect(self.accept)
+        btn_layout.addWidget(close_btn)
+        layout.addLayout(btn_layout)
+    
+    def load_warehouses(self):
+        """بارگذاری انبارها"""
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute("SELECT id, code, name FROM warehouses WHERE is_active = 1 ORDER BY code")
+            for row in c.fetchall():
+                self.warehouse_filter.addItem(
+                    f"{row['code']} - {row['name']}", row['id']
+                )
+    
+    def load_data(self):
+        """بارگذاری لیست اسناد"""
+        try:
+            warehouse_id = self.warehouse_filter.currentData()
+            status = self.status_filter.currentData()
+            
+            query = """
+                SELECT ic.*, w.name as warehouse_name
+                FROM inventory_counts ic
+                LEFT JOIN warehouses w ON ic.warehouse_id = w.id
+                WHERE 1=1
+            """
+            params = []
+            
+            if warehouse_id:
+                query += " AND ic.warehouse_id = ?"
+                params.append(warehouse_id)
+            
+            if status:
+                query += " AND ic.status = ?"
+                params.append(status)
+            
+            query += " ORDER BY ic.id DESC"
+            
+            with get_db() as conn:
+                c = conn.cursor()
+                c.execute(query, params)
+                counts = [dict(row) for row in c.fetchall()]
+            
+            self.table.setRowCount(len(counts))
+            
+            total_variance = 0
+            
+            for i, count in enumerate(counts):
+                self.table.setItem(i, 0, QTableWidgetItem(count.get('count_no', '')))
+                self.table.setItem(i, 1, QTableWidgetItem(
+                    safe_display_date(count.get('date', ''))
+                ))
+                self.table.setItem(i, 2, QTableWidgetItem(
+                    count.get('warehouse_name', '-')
+                ))
+                
+                total_items = QTableWidgetItem(str(count.get('total_items', 0)))
+                total_items.setTextAlignment(Qt.AlignCenter)
+                self.table.setItem(i, 3, total_items)
+                
+                variance_items = QTableWidgetItem(str(count.get('variance_items', 0)))
+                variance_items.setTextAlignment(Qt.AlignCenter)
+                if count.get('variance_items', 0) > 0:
+                    variance_items.setForeground(QColor('#e74c3c'))
+                    variance_items.setFont(QFont("Tahoma", 10, QFont.Bold))
+                self.table.setItem(i, 4, variance_items)
+                
+                var_value = count.get('total_variance_value', 0) or 0
+                var_item = QTableWidgetItem(f"{var_value:,.0f}")
+                var_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                if var_value != 0:
+                    var_item.setForeground(
+                        QColor('#e74c3c') if var_value > 0 else QColor('#27ae60')
+                    )
+                self.table.setItem(i, 5, var_item)
+                total_variance += abs(var_value)
+                
+                status_map = {
+                    'draft': ('📝 پیش‌نویس', '#f39c12'),
+                    'approved': ('✅ تأیید شده', '#27ae60'),
+                    'cancelled': ('❌ لغو شده', '#95a5a6'),
+                }
+                status_text, status_color = status_map.get(
+                    count.get('status', 'draft'), ('❓', '#666')
+                )
+                status_item = QTableWidgetItem(status_text)
+                status_item.setForeground(QColor(status_color))
+                status_item.setFont(QFont("Tahoma", 9, QFont.Bold))
+                self.table.setItem(i, 6, status_item)
+                
+                self.table.setItem(i, 7, QTableWidgetItem(
+                    count.get('created_by', '-') or '-'
+                ))
+            
+            self.summary_label.setText(
+                f"📊 {len(counts)} سند | "
+                f"مجموع ارزش مغایرت: {total_variance:,.0f} ریال"
+            )
+        
+        except Exception as e:
+            logger.error(f"خطا در بارگذاری: {e}", exc_info=True)
+            QMessageBox.warning(self, "خطا", f"❌ {str(e)}")
+    
+    def new_count(self):
+        """ایجاد سند جدید"""
+        dialog = InventoryCountDialog(parent=self)
+        if dialog.exec_():
+            self.load_data()
+    
+    def open_count(self):
+        """باز کردن سند انتخاب‌شده"""
+        row = self.table.currentRow()
+        if row < 0:
+            QMessageBox.warning(self, "خطا", "یک سند انتخاب کنید!")
+            return
+        
+        count_no = self.table.item(row, 0).text()
+        
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute("SELECT id FROM inventory_counts WHERE count_no = ?", [count_no])
+            row_data = c.fetchone()
+            if not row_data:
+                return
+            count_id = row_data['id']
+        
+        dialog = InventoryCountDialog(count_id=count_id, parent=self)
+        if dialog.exec_():
+            self.load_data()
+    
+    def delete_count(self):
+        """حذف سند"""
+        row = self.table.currentRow()
+        if row < 0:
+            QMessageBox.warning(self, "خطا", "یک سند انتخاب کنید!")
+            return
+        
+        count_no = self.table.item(row, 0).text()
+        status = self.table.item(row, 6).text()
+        
+        if 'تأیید' in status:
+            QMessageBox.warning(
+                self, "خطا",
+                "❌ اسناد تأییدشده قابل حذف نیستند!\n\n"
+                "برای بی‌اثر کردن، سند را لغو کنید."
+            )
+            return
+        
+        reply = QMessageBox.question(
+            self, "تأیید حذف",
+            f"آیا از حذف سند {count_no} اطمینان دارید؟",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        
+        if reply != QMessageBox.Yes:
+            return
+        
+        try:
+            with get_db() as conn:
+                c = conn.cursor()
+                c.execute("DELETE FROM inventory_counts WHERE count_no = ?", [count_no])
+                conn.commit()
+            
+            self.load_data()
+            QMessageBox.information(self, "موفق", "✅ سند حذف شد!")
+        
+        except Exception as e:
+            QMessageBox.warning(self, "خطا", f"❌ {str(e)}")
+    
+    def apply_theme(self):
+        """تم ساده"""
+        self.setStyleSheet("""
+            QDialog { background: #f5f6fa; }
+            QLabel { color: #1a1a2e; }
+            QTableWidget {
+                background: white; color: #1a1a2e;
+                border: 1px solid #dcdde1; border-radius: 6px;
+                gridline-color: #dcdde1;
+            }
+            QTableWidget::item:selected {
+                background: #1976D2; color: white;
+            }
+            QHeaderView::section {
+                background: #273c75; color: white;
+                padding: 8px; border: none; font-weight: bold;
+            }
+            QLineEdit, QComboBox {
+                background: white; color: #1a1a2e;
+                border: 1px solid #dcdde1; border-radius: 6px;
+                padding: 6px 10px; min-height: 28px;
+            }
+            QLineEdit:focus, QComboBox:focus {
+                border: 2px solid #1976D2;
+            }
+        """)
+
+
+# ============================================================
+# دیالوگ ایجاد/ویرایش سند انبارگردانی
+# ============================================================
+
+class InventoryCountDialog(BaseDialog):
+    """دیالوگ سند انبارگردانی"""
+    
+    def __init__(self, count_id=None, parent=None):
+        super().__init__(parent, base_width=1150, base_height=800)
+        self.count_id = count_id
+        self.is_new = count_id is None
+        self.current_status = 'draft'
+        self.items_data = []
+        
+        if self.is_new:
+            self.setWindowTitle("📋 سند انبارگردانی جدید")
+        else:
+            self.setWindowTitle("📋 ویرایش سند انبارگردانی")
+        
+        self.setModal(True)
+        self.setup_ui()
+        
+        if self.is_new:
+            self.prepare_new()
+        else:
+            self.load_data()
+        
+        self.apply_theme()
+    
+    def setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+        layout.setContentsMargins(15, 15, 15, 15)
+        
+        # ═══════════════════════════════════════════════════
+        # اطلاعات سند
+        # ═══════════════════════════════════════════════════
+        info_group = QGroupBox("📋 اطلاعات سند")
+        info_group.setStyleSheet("""
+            QGroupBox {
+                font-weight: bold; border: 2px solid #273c75;
+                border-radius: 8px; margin-top: 10px;
+                padding-top: 15px; background: white;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin; left: 10px;
+                padding: 0 10px; color: #273c75;
+            }
+        """)
+        info_layout = QHBoxLayout(info_group)
+        info_layout.setSpacing(15)
+        
+        # شماره سند
+        info_layout.addWidget(QLabel("🔢 شماره:"))
+        self.count_no_input = QLineEdit()
+        self.count_no_input.setReadOnly(True)
+        self.count_no_input.setMaximumWidth(150)
+        self.count_no_input.setStyleSheet(
+            "padding: 8px; background: #f0f0f0; border-radius: 4px; font-weight: bold;"
+        )
+        info_layout.addWidget(self.count_no_input)
+        
+        # تاریخ
+        info_layout.addWidget(QLabel("📅 تاریخ:"))
+        self.date_input = ShamsiDateEdit()
+        self.date_input.setMinimumWidth(130)
+        info_layout.addWidget(self.date_input)
+        
+        # انبار
+        info_layout.addWidget(QLabel("🏢 انبار:"))
+        self.warehouse_combo = QComboBox()
+        self.warehouse_combo.setMinimumWidth(200)
+        self.warehouse_combo.currentIndexChanged.connect(self.on_warehouse_changed)
+        info_layout.addWidget(self.warehouse_combo)
+        
+        info_layout.addStretch()
+        
+        # وضعیت
+        self.status_label = QLabel("📝 پیش‌نویس")
+        self.status_label.setStyleSheet("""
+            background: #f39c12; color: white;
+            padding: 8px 16px; border-radius: 6px;
+            font-weight: bold; font-size: 11pt;
+        """)
+        info_layout.addWidget(self.status_label)
+        
+        layout.addWidget(info_group)
+        
+        # ═══════════════════════════════════════════════════
+        # نوار فیلتر
+        # ═══════════════════════════════════════════════════
+        filter_bar = QHBoxLayout()
+        
+        filter_bar.addWidget(QLabel("🔍 جستجو:"))
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("کد یا نام کالا...")
+        self.search_input.setMaximumWidth(250)
+        self.search_input.textChanged.connect(self.filter_items)
+        filter_bar.addWidget(self.search_input)
+        
+        self.show_only_variance = QCheckBox("فقط کالاهای مغایرت‌دار")
+        self.show_only_variance.stateChanged.connect(self.filter_items)
+        filter_bar.addWidget(self.show_only_variance)
+        
+        filter_bar.addStretch()
+        
+        # آمار سریع
+        self.quick_stats = QLabel("")
+        self.quick_stats.setStyleSheet(
+            "color: #666; font-size: 10pt; font-weight: bold;"
+        )
+        filter_bar.addWidget(self.quick_stats)
+        
+        layout.addLayout(filter_bar)
+        
+        # ═══════════════════════════════════════════════════
+        # جدول اقلام
+        # ═══════════════════════════════════════════════════
+        self.items_table = QTableWidget()
+        self.items_table.setColumnCount(8)
+        self.items_table.setHorizontalHeaderLabels([
+            "کد", "نام کالا", "واحد",
+            "موجودی سیستم", "موجودی واقعی", "مغایرت",
+            "قیمت واحد", "ارزش مغایرت"
+        ])
+        self.items_table.setAlternatingRowColors(True)
+        self.items_table.horizontalHeader().setStretchLastSection(True)
+        self.items_table.setColumnWidth(0, 100)
+        self.items_table.setColumnWidth(1, 250)
+        self.items_table.setColumnWidth(2, 70)
+        self.items_table.setColumnWidth(3, 120)
+        self.items_table.setColumnWidth(4, 130)
+        self.items_table.setColumnWidth(5, 110)
+        self.items_table.setColumnWidth(6, 120)
+        self.items_table.setMinimumHeight(380)
+        layout.addWidget(self.items_table)
+        
+        # ═══════════════════════════════════════════════════
+        # خلاصه
+        # ═══════════════════════════════════════════════════
+        summary_group = QGroupBox("📊 خلاصه")
+        summary_group.setStyleSheet("""
+            QGroupBox {
+                font-weight: bold; border: 2px solid #27ae60;
+                border-radius: 8px; margin-top: 10px;
+                padding-top: 15px; background: white;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin; left: 10px;
+                padding: 0 10px; color: #27ae60;
+            }
+        """)
+        summary_layout = QGridLayout(summary_group)
+        summary_layout.setSpacing(15)
+        
+        # تعداد کل
+        summary_layout.addWidget(QLabel("📦 تعداد کل کالا:"), 0, 0)
+        self.total_items_label = QLabel("0")
+        self.total_items_label.setStyleSheet(
+            "font-weight: bold; font-size: 12pt; color: #273c75;"
+        )
+        summary_layout.addWidget(self.total_items_label, 0, 1)
+        
+        # اقلام مغایرت‌دار
+        summary_layout.addWidget(QLabel("⚠️ اقلام مغایرت‌دار:"), 0, 2)
+        self.variance_items_label = QLabel("0")
+        self.variance_items_label.setStyleSheet(
+            "font-weight: bold; font-size: 12pt; color: #e74c3c;"
+        )
+        summary_layout.addWidget(self.variance_items_label, 0, 3)
+        
+        # کمبود
+        summary_layout.addWidget(QLabel("📉 کمبود (خروج):"), 1, 0)
+        self.shortage_label = QLabel("0 ریال")
+        self.shortage_label.setStyleSheet(
+            "font-weight: bold; font-size: 12pt; color: #e74c3c;"
+        )
+        summary_layout.addWidget(self.shortage_label, 1, 1)
+        
+        # اضافه
+        summary_layout.addWidget(QLabel("📈 اضافه (ورود):"), 1, 2)
+        self.surplus_label = QLabel("0 ریال")
+        self.surplus_label.setStyleSheet(
+            "font-weight: bold; font-size: 12pt; color: #27ae60;"
+        )
+        summary_layout.addWidget(self.surplus_label, 1, 3)
+        
+        summary_layout.setColumnStretch(4, 1)
+        layout.addWidget(summary_group)
+        
+        # ═══════════════════════════════════════════════════
+        # دکمه‌ها
+        # ═══════════════════════════════════════════════════
+        btn_layout = QHBoxLayout()
+        
+        print_btn = QPushButton("🖨️ چاپ برگه")
+        print_btn.setStyleSheet("""
+            QPushButton {
+                background: #3498db; color: white; padding: 12px 24px;
+                border: none; border-radius: 6px; font-weight: bold;
+                font-size: 11pt;
+            }
+            QPushButton:hover { background: #2980b9; }
+        """)
+        print_btn.clicked.connect(self.print_sheet)
+        btn_layout.addWidget(print_btn)
+        
+        btn_layout.addStretch()
+        
+        self.save_btn = QPushButton("💾 ذخیره")
+        self.save_btn.setStyleSheet("""
+            QPushButton {
+                background: #4CAF50; color: white; padding: 12px 24px;
+                border: none; border-radius: 6px; font-weight: bold;
+                font-size: 11pt;
+            }
+            QPushButton:hover { background: #388E3C; }
+        """)
+        self.save_btn.clicked.connect(self.save_draft)
+        btn_layout.addWidget(self.save_btn)
+        
+        self.approve_btn = QPushButton("✅ تأیید و اصلاح موجودی")
+        self.approve_btn.setStyleSheet("""
+            QPushButton {
+                background: #e94560; color: white; padding: 12px 24px;
+                border: none; border-radius: 6px; font-weight: bold;
+                font-size: 11pt;
+            }
+            QPushButton:hover { background: #c0392b; }
+        """)
+        self.approve_btn.clicked.connect(self.approve_and_apply)
+        btn_layout.addWidget(self.approve_btn)
+        
+        cancel_btn = QPushButton("❌ بستن")
+        cancel_btn.setStyleSheet("""
+            QPushButton {
+                background: #95a5a6; color: white; padding: 12px 24px;
+                border: none; border-radius: 6px; font-weight: bold;
+                font-size: 11pt;
+            }
+            QPushButton:hover { background: #7f8c8d; }
+        """)
+        cancel_btn.clicked.connect(self.reject)
+        btn_layout.addWidget(cancel_btn)
+        
+        layout.addLayout(btn_layout)
+    
+    # ═══════════════════════════════════════════════════════
+    # آماده‌سازی سند جدید
+    # ═══════════════════════════════════════════════════════
+    
+    def prepare_new(self):
+        """آماده‌سازی سند جدید"""
+        self.count_no_input.setText(self._generate_count_no())
+        self.date_input.set_date(get_today_jalali())
+        self._load_warehouses()
+    
+    def _generate_count_no(self) -> str:
+        """تولید شماره سند بعدی"""
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute("""
+                SELECT MAX(CAST(SUBSTR(count_no, 5) AS INTEGER))
+                FROM inventory_counts WHERE count_no LIKE 'INV-%'
+            """)
+            max_no = c.fetchone()[0] or 0
+            return f"INV-{(max_no + 1):05d}"
+    
+    def _load_warehouses(self):
+        """بارگذاری انبارها"""
+        self.warehouse_combo.blockSignals(True)
+        self.warehouse_combo.clear()
+        
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute("""
+                SELECT id, code, name, is_default
+                FROM warehouses WHERE is_active = 1 ORDER BY code
+            """)
+            rows = c.fetchall()
+            
+            default_idx = -1
+            for i, row in enumerate(rows):
+                self.warehouse_combo.addItem(
+                    f"{row['code']} - {row['name']}", row['id']
+                )
+                if row['is_default']:
+                    default_idx = i
+            
+            if default_idx >= 0:
+                self.warehouse_combo.setCurrentIndex(default_idx)
+        
+        self.warehouse_combo.blockSignals(False)
+        
+        if self.warehouse_combo.count() > 0:
+            self.on_warehouse_changed()
+    
+    def on_warehouse_changed(self):
+        """وقتی انبار تغییر کرد"""
+        if self.is_new:
+            self.load_items_for_count()
+    
+    # ═══════════════════════════════════════════════════════
+    # بارگذاری اقلام
+    # ═══════════════════════════════════════════════════════
+    
+    def load_items_for_count(self):
+        """بارگذاری کالاهای موجود در انبار"""
+        warehouse_id = self.warehouse_combo.currentData()
+        if not warehouse_id:
+            return
+        
+        try:
+            with get_db() as conn:
+                c = conn.cursor()
+                
+                c.execute("""
+                    SELECT 
+                        p.id, p.code, p.name, p.unit,
+                        COALESCE(ws.quantity, 0) as system_qty,
+                        COALESCE(p.purchase_price, 0) as unit_price
+                    FROM products p
+                    LEFT JOIN warehouse_stock ws 
+                        ON p.id = ws.product_id AND ws.warehouse_id = ?
+                    WHERE p.is_active = 1
+                    ORDER BY p.code
+                """, [warehouse_id])
+                
+                self.items_data = []
+                for row in c.fetchall():
+                    self.items_data.append({
+                        'product_id': row['id'],
+                        'code': row['code'],
+                        'name': row['name'],
+                        'unit': row['unit'] or 'عدد',
+                        'system_qty': float(row['system_qty'] or 0),
+                        'actual_qty': float(row['system_qty'] or 0),
+                        'unit_price': float(row['unit_price'] or 0),
+                        'counted': 0,
+                        'notes': '',
+                    })
+            
+            self.render_table()
+        
+        except Exception as e:
+            logger.error(f"خطا در بارگذاری اقلام: {e}", exc_info=True)
+            QMessageBox.warning(self, "خطا", f"❌ {str(e)}")
+    
+    def render_table(self):
+        """رندر جدول اقلام"""
+        self.items_table.blockSignals(True)
+        self.items_table.setRowCount(0)
+        
+        search_text = self.search_input.text().strip().lower()
+        only_variance = self.show_only_variance.isChecked()
+        
+        visible_items = []
+        for item in self.items_data:
+            if search_text:
+                if search_text not in item['code'].lower() and \
+                   search_text not in item['name'].lower():
+                    continue
+            
+            if only_variance:
+                variance = item['actual_qty'] - item['system_qty']
+                if abs(variance) < 0.001:
+                    continue
+            
+            visible_items.append(item)
+        
+        self.items_table.setRowCount(len(visible_items))
+        
+        for i, item in enumerate(visible_items):
+            # ─── کد ───
+            code_item = QTableWidgetItem(item['code'])
+            code_item.setFlags(code_item.flags() & ~Qt.ItemIsEditable)
+            self.items_table.setItem(i, 0, code_item)
+            
+            # ─── نام ───
+            name_item = QTableWidgetItem(item['name'])
+            name_item.setFlags(name_item.flags() & ~Qt.ItemIsEditable)
+            self.items_table.setItem(i, 1, name_item)
+            
+            # ─── واحد ───
+            unit_item = QTableWidgetItem(item['unit'])
+            unit_item.setFlags(unit_item.flags() & ~Qt.ItemIsEditable)
+            unit_item.setTextAlignment(Qt.AlignCenter)
+            self.items_table.setItem(i, 2, unit_item)
+            
+            # ─── موجودی سیستم ───
+            sys_item = QTableWidgetItem(f"{item['system_qty']:,.2f}")
+            sys_item.setFlags(sys_item.flags() & ~Qt.ItemIsEditable)
+            sys_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            sys_item.setForeground(QColor('#666'))
+            self.items_table.setItem(i, 3, sys_item)
+            
+            # ─── موجودی واقعی (قابل ویرایش) ───
+            actual_widget = QDoubleSpinBox()
+            actual_widget.setRange(0, 9999999)
+            actual_widget.setDecimals(2)
+            actual_widget.setValue(item['actual_qty'])
+            actual_widget.setStyleSheet("""
+                QDoubleSpinBox {
+                    background: #fff9e6;
+                    border: 2px solid #f39c12;
+                    border-radius: 4px;
+                    padding: 4px;
+                    font-weight: bold;
+                    min-height: 28px;
+                }
+                QDoubleSpinBox:focus {
+                    background: #fff3cd;
+                    border-color: #e67e22;
+                }
+            """)
+            actual_widget.valueChanged.connect(
+                lambda v, idx=i, it=item: self._on_actual_changed(idx, v, it)
+            )
+            self.items_table.setCellWidget(i, 4, actual_widget)
+            
+            # ─── مغایرت ───
+            variance = item['actual_qty'] - item['system_qty']
+            var_item = QTableWidgetItem(f"{variance:+,.2f}")
+            var_item.setFlags(var_item.flags() & ~Qt.ItemIsEditable)
+            var_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            var_item.setFont(QFont("Tahoma", 10, QFont.Bold))
+            if abs(variance) < 0.001:
+                var_item.setForeground(QColor('#95a5a6'))
+            elif variance < 0:
+                var_item.setForeground(QColor('#e74c3c'))
+            else:
+                var_item.setForeground(QColor('#27ae60'))
+            self.items_table.setItem(i, 5, var_item)
+            
+            # ─── قیمت واحد ───
+            price_item = QTableWidgetItem(f"{item['unit_price']:,.0f}")
+            price_item.setFlags(price_item.flags() & ~Qt.ItemIsEditable)
+            price_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            self.items_table.setItem(i, 6, price_item)
+            
+            # ─── ارزش مغایرت ───
+            var_value = variance * item['unit_price']
+            value_item = QTableWidgetItem(
+                f"{var_value:+,.0f}" if abs(var_value) > 0.5 else "-"
+            )
+            value_item.setFlags(value_item.flags() & ~Qt.ItemIsEditable)
+            value_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            if abs(var_value) > 0.5:
+                value_item.setForeground(
+                    QColor('#27ae60') if var_value > 0 else QColor('#e74c3c')
+                )
+            self.items_table.setItem(i, 7, value_item)
+        
+        self.items_table.blockSignals(False)
+        self._update_summary()
+    
+    def _on_actual_changed(self, row: int, value: float, item: dict):
+        """وقتی موجودی واقعی تغییر کرد"""
+        item['actual_qty'] = value
+        item['counted'] = 1
+        
+        variance = value - item['system_qty']
+        
+        var_item = self.items_table.item(row, 5)
+        if var_item:
+            var_item.setText(f"{variance:+,.2f}")
+            if abs(variance) < 0.001:
+                var_item.setForeground(QColor('#95a5a6'))
+            elif variance < 0:
+                var_item.setForeground(QColor('#e74c3c'))
+            else:
+                var_item.setForeground(QColor('#27ae60'))
+        
+        var_value = variance * item['unit_price']
+        value_item = self.items_table.item(row, 7)
+        if value_item:
+            value_item.setText(
+                f"{var_value:+,.0f}" if abs(var_value) > 0.5 else "-"
+            )
+            if abs(var_value) > 0.5:
+                value_item.setForeground(
+                    QColor('#27ae60') if var_value > 0 else QColor('#e74c3c')
+                )
+            else:
+                value_item.setForeground(QColor('#1a1a2e'))
+        
+        self._update_summary()
+    
+    def filter_items(self):
+        """فیلتر اقلام"""
+        self.render_table()
+    
+    def _update_summary(self):
+        """به‌روزرسانی خلاصه"""
+        total_items = len(self.items_data)
+        variance_items = 0
+        shortage_value = 0.0
+        surplus_value = 0.0
+        
+        for item in self.items_data:
+            variance = item['actual_qty'] - item['system_qty']
+            if abs(variance) >= 0.001:
+                variance_items += 1
+            
+            var_value = variance * item['unit_price']
+            if var_value > 0:
+                surplus_value += var_value
+            elif var_value < 0:
+                shortage_value += abs(var_value)
+        
+        self.total_items_label.setText(str(total_items))
+        self.variance_items_label.setText(str(variance_items))
+        self.shortage_label.setText(f"{shortage_value:,.0f} ریال")
+        self.surplus_label.setText(f"{surplus_value:,.0f} ریال")
+        
+        if variance_items > 0:
+            self.quick_stats.setText(
+                f"⚠️ {variance_items} قلم مغایرت | "
+                f"📉 {shortage_value:,.0f} | "
+                f"📈 {surplus_value:,.0f}"
+            )
+            self.quick_stats.setStyleSheet(
+                "color: #e74c3c; font-size: 10pt; font-weight: bold;"
+            )
+        else:
+            self.quick_stats.setText("✅ همه اقلام مطابق")
+            self.quick_stats.setStyleSheet(
+                "color: #27ae60; font-size: 10pt; font-weight: bold;"
+            )
+    
+    # ═══════════════════════════════════════════════════════
+    # بارگذاری سند موجود
+    # ═══════════════════════════════════════════════════════
+    
+    def load_data(self):
+        """بارگذاری سند موجود"""
+        try:
+            with get_db() as conn:
+                c = conn.cursor()
+                
+                c.execute("SELECT * FROM inventory_counts WHERE id = ?", [self.count_id])
+                count = c.fetchone()
+                if not count:
+                    QMessageBox.warning(self, "خطا", "سند یافت نشد!")
+                    self.reject()
+                    return
+                
+                count = dict(count)
+                self.current_status = count.get('status', 'draft')
+                
+                self.count_no_input.setText(count.get('count_no', ''))
+                if count.get('date'):
+                    self.date_input.set_date(count['date'])
+                
+                self._load_warehouses()
+                
+                idx = self.warehouse_combo.findData(count.get('warehouse_id'))
+                if idx >= 0:
+                    self.warehouse_combo.setCurrentIndex(idx)
+                self.warehouse_combo.setEnabled(False)
+                
+                c.execute("""
+                    SELECT ici.*, p.code, p.name, p.unit
+                    FROM inventory_count_items ici
+                    JOIN products p ON ici.product_id = p.id
+                    WHERE ici.count_id = ?
+                    ORDER BY p.code
+                """, [self.count_id])
+                
+                self.items_data = []
+                for row in c.fetchall():
+                    r = dict(row)
+                    self.items_data.append({
+                        'product_id': r['product_id'],
+                        'code': r['code'],
+                        'name': r['name'],
+                        'unit': r['unit'] or 'عدد',
+                        'system_qty': float(r['system_qty'] or 0),
+                        'actual_qty': float(r['actual_qty'] or 0),
+                        'unit_price': float(r['unit_price'] or 0),
+                        'counted': r.get('counted', 0),
+                        'notes': r.get('notes', ''),
+                    })
+                
+                self.render_table()
+                self._update_status_ui()
+            
+            if self.current_status != 'draft':
+                self._lock_ui()
+        
+        except Exception as e:
+            logger.error(f"خطا در بارگذاری: {e}", exc_info=True)
+            QMessageBox.warning(self, "خطا", f"❌ {str(e)}")
+    
+    def _update_status_ui(self):
+        """به‌روزرسانی UI بر اساس وضعیت"""
+        status_map = {
+            'draft': ('📝 پیش‌نویس', '#f39c12'),
+            'approved': ('✅ تأیید شده', '#27ae60'),
+            'cancelled': ('❌ لغو شده', '#95a5a6'),
+        }
+        text, color = status_map.get(self.current_status, ('❓', '#666'))
+        self.status_label.setText(text)
+        self.status_label.setStyleSheet(f"""
+            background: {color}; color: white;
+            padding: 8px 16px; border-radius: 6px;
+            font-weight: bold; font-size: 11pt;
+        """)
+    
+    def _lock_ui(self):
+        """قفل کردن UI برای اسناد تأییدشده"""
+        self.items_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        for i in range(self.items_table.rowCount()):
+            w = self.items_table.cellWidget(i, 4)
+            if w:
+                w.setEnabled(False)
+        
+        self.save_btn.setEnabled(False)
+        self.approve_btn.setEnabled(False)
+    
+    # ═══════════════════════════════════════════════════════
+    # ذخیره پیش‌نویس
+    # ═══════════════════════════════════════════════════════
+    
+    def save_draft(self):
+        """ذخیره سند به‌صورت پیش‌نویس"""
+        if self.current_status != 'draft':
+            QMessageBox.warning(self, "خطا", "فقط پیش‌نویس قابل ذخیره است!")
+            return
+        
+        warehouse_id = self.warehouse_combo.currentData()
+        if not warehouse_id:
+            QMessageBox.warning(self, "خطا", "انبار را انتخاب کنید!")
+            return
+        
+        try:
+            with get_db() as conn:
+                c = conn.cursor()
+                
+                count_no = self.count_no_input.text().strip()
+                date = self.date_input.get_shamsi()
+                
+                variance_items = sum(
+                    1 for item in self.items_data
+                    if abs(item['actual_qty'] - item['system_qty']) >= 0.001
+                )
+                total_variance_value = sum(
+                    (item['actual_qty'] - item['system_qty']) * item['unit_price']
+                    for item in self.items_data
+                )
+                
+                if self.is_new:
+                    c.execute("""
+                        INSERT INTO inventory_counts 
+                        (count_no, warehouse_id, date, status, 
+                         total_items, counted_items, variance_items, 
+                         total_variance_value, created_by)
+                        VALUES (?, ?, ?, 'draft', ?, ?, ?, ?, ?)
+                    """, [
+                        count_no, warehouse_id, date,
+                        len(self.items_data),
+                        sum(1 for item in self.items_data if item.get('counted')),
+                        variance_items,
+                        int(total_variance_value),
+                        'کاربر'
+                    ])
+                    self.count_id = c.lastrowid
+                    self.is_new = False
+                else:
+                    c.execute("""
+                        UPDATE inventory_counts 
+                        SET total_items = ?, counted_items = ?,
+                            variance_items = ?, total_variance_value = ?,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ?
+                    """, [
+                        len(self.items_data),
+                        sum(1 for item in self.items_data if item.get('counted')),
+                        variance_items,
+                        int(total_variance_value),
+                        self.count_id
+                    ])
+                    
+                    c.execute("DELETE FROM inventory_count_items WHERE count_id = ?",
+                             [self.count_id])
+                
+                for item in self.items_data:
+                    variance = item['actual_qty'] - item['system_qty']
+                    variance_value = variance * item['unit_price']
+                    
+                    c.execute("""
+                        INSERT INTO inventory_count_items 
+                        (count_id, product_id, system_qty, actual_qty,
+                         variance, unit_price, variance_value, notes, counted)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, [
+                        self.count_id, item['product_id'],
+                        item['system_qty'], item['actual_qty'],
+                        variance, item['unit_price'], variance_value,
+                        item.get('notes', ''), item.get('counted', 0)
+                    ])
+                
+                conn.commit()
+            
+            QMessageBox.information(
+                self, "موفق",
+                f"✅ سند پیش‌نویس ذخیره شد!\n\n"
+                f"شماره: {count_no}\n"
+                f"اقلام مغایرت‌دار: {variance_items}\n"
+                f"ارزش مغایرت: {total_variance_value:,.0f} ریال"
+            )
+            
+            self.setWindowTitle(f"📋 ویرایش سند {count_no}")
+        
+        except Exception as e:
+            logger.error(f"خطا در ذخیره: {e}", exc_info=True)
+            QMessageBox.warning(self, "خطا", f"❌ {str(e)}")
+    
+    # ═══════════════════════════════════════════════════════
+    # تأیید و اصلاح موجودی
+    # ═══════════════════════════════════════════════════════
+    
+    def approve_and_apply(self):
+        """تأیید سند و اصلاح موجودی"""
+        if self.is_new:
+            QMessageBox.warning(
+                self, "خطا",
+                "ابتدا سند را ذخیره کنید (دکمه 💾 ذخیره)، سپس تأیید کنید."
+            )
+            return
+        
+        if self.current_status != 'draft':
+            QMessageBox.warning(self, "خطا", "فقط پیش‌نویس قابل تأیید است!")
+            return
+        
+        variance_items = [
+            item for item in self.items_data
+            if abs(item['actual_qty'] - item['system_qty']) >= 0.001
+        ]
+        
+        if not variance_items:
+            reply = QMessageBox.question(
+                self, "تأیید",
+                "هیچ مغایرتی وجود ندارد. آیا سند را تأیید می‌کنید؟",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if reply != QMessageBox.Yes:
+                return
+        else:
+            total_shortage = sum(
+                abs((item['actual_qty'] - item['system_qty']) * item['unit_price'])
+                for item in variance_items
+                if item['actual_qty'] < item['system_qty']
+            )
+            total_surplus = sum(
+                (item['actual_qty'] - item['system_qty']) * item['unit_price']
+                for item in variance_items
+                if item['actual_qty'] > item['system_qty']
+            )
+            
+            msg = (
+                f"⚠️ تأیید سند انبارگردانی\n\n"
+                f"تعداد اقلام مغایرت‌دار: {len(variance_items)}\n"
+                f"📉 ارزش کمبود: {total_shortage:,.0f} ریال\n"
+                f"📈 ارزش اضافه: {total_surplus:,.0f} ریال\n\n"
+                f"⚠️ با تأیید، موجودی سیستم اصلاح می‌شود.\n"
+                f"این عمل قابل بازگشت نیست!\n\n"
+                f"آیا مطمئن هستید؟"
+            )
+            
+            reply = QMessageBox.warning(
+                self, "تأیید نهایی",
+                msg,
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            if reply != QMessageBox.Yes:
+                return
+        
+        try:
+            with get_db() as conn:
+                c = conn.cursor()
+                
+                warehouse_id = self.warehouse_combo.currentData()
+                date = self.date_input.get_shamsi()
+                
+                for item in self.items_data:
+                    variance = item['actual_qty'] - item['system_qty']
+                    
+                    if abs(variance) < 0.001:
+                        continue
+                    
+                    transaction_type = 'in' if variance > 0 else 'out'
+                    
+                    InventoryHelper.adjust_stock(
+                        product_id=item['product_id'],
+                        quantity=abs(variance),
+                        transaction_type=transaction_type,
+                        warehouse_id=warehouse_id,
+                        conn=conn
+                    )
+                    
+                    c.execute("""
+                        INSERT INTO stock_transactions 
+                        (date, product_id, warehouse_id, type, quantity,
+                         unit_price, total_price, description)
+                        VALUES (?, ?, ?, 'adjustment', ?, ?, ?, ?)
+                    """, [
+                        date, item['product_id'], warehouse_id,
+                        abs(variance), item['unit_price'],
+                        abs(variance) * item['unit_price'],
+                        f"اصلاح انبارگردانی {self.count_no_input.text()}"
+                    ])
+                
+                c.execute("""
+                    UPDATE inventory_counts
+                    SET status = 'approved',
+                        approved_by = 'کاربر',
+                        approved_at = CURRENT_TIMESTAMP,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                """, [self.count_id])
+                
+                conn.commit()
+            
+            self.current_status = 'approved'
+            self._update_status_ui()
+            self._lock_ui()
+            
+            QMessageBox.information(
+                self, "موفق",
+                f"✅ سند تأیید شد و موجودی اصلاح گردید!\n\n"
+                f"تعداد اقلام اصلاح‌شده: {len(variance_items)}"
+            )
+            
+            self._update_summary()
+        
+        except Exception as e:
+            logger.error(f"خطا در تأیید: {e}", exc_info=True)
+            QMessageBox.warning(self, "خطا", f"❌ {str(e)}")
+    
+    # ═══════════════════════════════════════════════════════
+    # چاپ برگه انبارگردانی
+    # ═══════════════════════════════════════════════════════
+    
+    def print_sheet(self):
+        """چاپ برگه انبارگردانی"""
+        try:
+            html = self._generate_print_html()
+            
+            printer = QPrinter(QPrinter.HighResolution)
+            printer.setPageSize(QPrinter.A4)
+            printer.setPageMargins(10, 10, 10, 10, QPrinter.Millimeter)
+            
+            preview = QPrintPreviewDialog(printer, self)
+            preview.paintRequested.connect(
+                lambda p: self._print_preview(p, html)
+            )
+            preview.exec_()
+        
+        except Exception as e:
+            logger.error(f"خطا در چاپ: {e}", exc_info=True)
+            QMessageBox.warning(self, "خطا", f"❌ {str(e)}")
+    
+    def _print_preview(self, printer, html):
+        doc = QTextDocument()
+        doc.setHtml(html)
+        doc.print_(printer)
+    
+    def _generate_print_html(self) -> str:
+        """تولید HTML برگه انبارگردانی"""
+        count_no = self.count_no_input.text()
+        date = self.date_input.get_shamsi()
+        warehouse_name = self.warehouse_combo.currentText()
+        
+        status_text = 'پیش‌نویس' if self.current_status == 'draft' else 'تأیید شده'
+        
+        html = f"""
+        <html>
+        <head>
+        <meta charset="UTF-8">
+        <style>
+            body {{
+                font-family: Tahoma, sans-serif;
+                direction: rtl;
+                padding: 15px;
+                color: #2c3e50;
+                font-size: 10pt;
+            }}
+            .header {{
+                text-align: center;
+                border-bottom: 2px solid #273c75;
+                padding-bottom: 10px;
+                margin-bottom: 15px;
+            }}
+            .title {{
+                font-size: 16pt;
+                font-weight: bold;
+                color: #273c75;
+            }}
+            .subtitle {{
+                font-size: 12pt;
+                color: #2c3e50;
+                margin-top: 5px;
+            }}
+            .info {{
+                padding: 10px;
+                background: #f8f9fa;
+                border-radius: 6px;
+                margin-bottom: 15px;
+            }}
+            .info table {{
+                width: 100%;
+            }}
+            .info td {{
+                padding: 5px;
+                font-size: 11pt;
+            }}
+            table.items {{
+                width: 100%;
+                border-collapse: collapse;
+                margin: 15px 0;
+            }}
+            table.items th {{
+                background-color: #273c75;
+                color: white;
+                padding: 8px 5px;
+                text-align: center;
+                font-size: 10pt;
+                border: 1px solid #1a252f;
+            }}
+            table.items td {{
+                border: 1px solid #ccc;
+                padding: 8px 5px;
+                text-align: center;
+                font-size: 10pt;
+                height: 25px;
+            }}
+            .empty-cell {{
+                background: #fffbea;
+            }}
+            .footer {{
+                margin-top: 20px;
+                text-align: center;
+                font-size: 9pt;
+                color: #666;
+                border-top: 1px solid #ddd;
+                padding-top: 10px;
+            }}
+            .sig-box {{
+                margin-top: 40px;
+                width: 100%;
+            }}
+            .sig-box table {{
+                width: 100%;
+            }}
+            .sig-item {{
+                width: 33%;
+                text-align: center;
+                font-size: 10pt;
+                vertical-align: bottom;
+            }}
+            .sig-line {{
+                border-bottom: 1px solid #666;
+                height: 40px;
+            }}
+        </style>
+        </head>
+        <body>
+            <div class="header">
+                <div class="title">📋 برگه انبارگردانی</div>
+                <div class="subtitle">شماره سند: {count_no}</div>
+            </div>
+            
+            <div class="info">
+                <table>
+                    <tr>
+                        <td><b>📅 تاریخ:</b> {date}</td>
+                        <td><b>🏢 انبار:</b> {warehouse_name}</td>
+                        <td><b>📝 وضعیت:</b> {status_text}</td>
+                    </tr>
+                </table>
+            </div>
+            
+            <table class="items">
+                <thead>
+                    <tr>
+                        <th style="width: 6%;">ردیف</th>
+                        <th style="width: 15%;">کد کالا</th>
+                        <th style="width: 30%;">نام کالا</th>
+                        <th style="width: 10%;">واحد</th>
+                        <th style="width: 13%;">موجودی سیستم</th>
+                        <th style="width: 13%;">موجودی واقعی</th>
+                        <th style="width: 13%;">مغایرت</th>
+                    </tr>
+                </thead>
+                <tbody>
+        """
+        
+        for i, item in enumerate(self.items_data, 1):
+            variance = item['actual_qty'] - item['system_qty']
+            
+            if abs(variance) < 0.001:
+                var_text = "-"
+                var_style = "color: #999;"
+            elif variance < 0:
+                var_text = f"{variance:+,.2f}"
+                var_style = "color: #e74c3c; font-weight: bold;"
+            else:
+                var_text = f"{variance:+,.2f}"
+                var_style = "color: #27ae60; font-weight: bold;"
+            
+            html += f"""
+                <tr>
+                    <td>{i}</td>
+                    <td>{item['code']}</td>
+                    <td style="text-align: right; padding-right: 15px;">{item['name']}</td>
+                    <td>{item['unit']}</td>
+                    <td style="background: #f0f0f0;">{item['system_qty']:,.2f}</td>
+                    <td class="empty-cell">{item['actual_qty']:,.2f}</td>
+                    <td style="{var_style}">{var_text}</td>
+                </tr>
+            """
+        
+        html += f"""
+                </tbody>
+            </table>
+            
+            <div class="sig-box">
+                <table>
+                    <tr>
+                        <td class="sig-item">
+                            <div class="sig-line"></div>
+                            شمارش‌کننده
+                        </td>
+                        <td class="sig-item">
+                            <div class="sig-line"></div>
+                            مسئول انبار
+                        </td>
+                        <td class="sig-item">
+                            <div class="sig-line"></div>
+                            تأییدکننده
+                        </td>
+                    </tr>
+                </table>
+            </div>
+            
+            <div class="footer">
+                تاریخ چاپ: {datetime.now().strftime('%Y/%m/%d %H:%M')} | ImanAccount
+            </div>
+        </body>
+        </html>
+        """
+        
+        return html
+    
+    # ═══════════════════════════════════════════════════════
+    # Theme
+    # ═══════════════════════════════════════════════════════
+    
+    def apply_theme(self):
+        self.setStyleSheet("""
+            QDialog { background: #f5f6fa; }
+            QLabel { color: #1a1a2e; }
+            QLineEdit, QComboBox {
+                background: white; color: #1a1a2e;
+                border: 1px solid #dcdde1; border-radius: 6px;
+                padding: 6px 10px; min-height: 28px;
+            }
+            QLineEdit:focus, QComboBox:focus {
+                border: 2px solid #1976D2;
+            }
+            QLineEdit[readOnly="true"] {
+                background: #f0f0f0;
+            }
+            QTableWidget {
+                background: white; color: #1a1a2e;
+                border: 1px solid #dcdde1; border-radius: 6px;
+                gridline-color: #dcdde1;
+            }
+            QTableWidget::item:selected {
+                background: #1976D2; color: white;
+            }
+            QHeaderView::section {
+                background: #273c75; color: white;
+                padding: 8px; border: none; font-weight: bold;
+            }
+            QCheckBox {
+                color: #1a1a2e; padding: 5px; spacing: 8px;
+            }
+        """)
 
 
 # ============================================================
@@ -910,7 +2357,10 @@ class InventoryWidget(BaseWidget):
             return "simple"
 
     def get_valuation_method_display(self):
-        methods = {'simple': 'ساده', 'fifo': 'FIFO', 'lifo': 'LIFO', 'weighted_average': 'میانگین موزون'}
+        methods = {
+            'simple': 'ساده', 'fifo': 'FIFO',
+            'lifo': 'LIFO', 'weighted_average': 'میانگین موزون'
+        }
         return methods.get(self.valuation_method, 'ساده')
 
     def set_user_level(self, level: str):
@@ -919,7 +2369,11 @@ class InventoryWidget(BaseWidget):
 
     def update_ui_by_permission(self):
         can_edit = self.user_level in ['admin', 'inventory']
-        for btn_name in ['new_btn', 'edit_btn', 'delete_btn', 'stock_in_btn', 'stock_out_btn', 'transfer_btn']:
+        for btn_name in [
+            'new_btn', 'edit_btn', 'delete_btn',
+            'stock_in_btn', 'stock_out_btn', 'transfer_btn',
+            'count_btn'  # ✅ دکمه انبارگردانی
+        ]:
             if hasattr(self, btn_name):
                 getattr(self, btn_name).setVisible(can_edit)
 
@@ -928,7 +2382,6 @@ class InventoryWidget(BaseWidget):
         main_layout.setSpacing(10)
         main_layout.setContentsMargins(10, 10, 10, 10)
 
-        # عنوان
         title_widget = QWidget()
         title_layout = QHBoxLayout(title_widget)
         title = QLabel("📦 مدیریت انبار پیشرفته")
@@ -972,6 +2425,14 @@ class InventoryWidget(BaseWidget):
         self.transfer_btn = self.create_button("🔄 انتقال", "infoBtn")
         self.transfer_btn.clicked.connect(self.transfer_stock)
         toolbar.addWidget(self.transfer_btn)
+
+        toolbar.addSpacing(10)
+
+        # ✅ دکمه انبارگردانی
+        self.count_btn = self.create_button("📋 انبارگردانی", "warningBtn")
+        self.count_btn.setToolTip("شمارش فیزیکی موجودی و اصلاح مغایرت‌ها")
+        self.count_btn.clicked.connect(self.open_inventory_count)
+        toolbar.addWidget(self.count_btn)
 
         toolbar.addSpacing(10)
 
@@ -1023,7 +2484,7 @@ class InventoryWidget(BaseWidget):
 
         main_layout.addWidget(filter_widget)
 
-        # جدول اصلی
+        # جدول
         self.products_table = QTableWidget()
         self.products_table.setColumnCount(14)
         self.products_table.setHorizontalHeaderLabels([
@@ -1073,11 +2534,6 @@ class InventoryWidget(BaseWidget):
                 self.category_filter.addItem(cat['category'], cat['category'])
 
     def load_products(self):
-        """
-        ✅ رفع مشکل: 
-        - اگه فیلتر انبار فعال → موجودی همون انبار
-        - وگرنه → مجموع همه انبارها
-        """
         try:
             warehouse_id = self.warehouse_filter.currentData()
             category = self.category_filter.currentData()
@@ -1087,7 +2543,6 @@ class InventoryWidget(BaseWidget):
                 c = conn.cursor()
                 
                 if warehouse_id:
-                    # ✅ حالت فیلتر انبار: فقط موجودی همون انبار
                     query = """
                         SELECT p.*, 
                                w.name as warehouse_name,
@@ -1100,7 +2555,6 @@ class InventoryWidget(BaseWidget):
                     """
                     params = [warehouse_id, warehouse_id]
                 else:
-                    # ✅ حالت همه انبارها: مجموع
                     query = """
                         SELECT p.*, 
                                GROUP_CONCAT(w.name, ' + ') as warehouse_name,
@@ -1129,9 +2583,7 @@ class InventoryWidget(BaseWidget):
                 c.execute(query, params)
                 rows = c.fetchall()
 
-                self.products_data = []
-                for row in rows:
-                    self.products_data.append(dict(row))
+                self.products_data = [dict(row) for row in rows]
 
             self.display_products()
             self.update_stats()
@@ -1194,7 +2646,10 @@ class InventoryWidget(BaseWidget):
                 status_item.setForeground(QColor('#27ae60'))
             self.products_table.setItem(i, 13, status_item)
 
-        self.total_label.setText(f"مجموع کالاها: {len(self.products_data):,} | ارزش کل: {total_value:,.0f} ریال")
+        self.total_label.setText(
+            f"مجموع کالاها: {len(self.products_data):,} | "
+            f"ارزش کل: {total_value:,.0f} ریال"
+        )
 
     def clear_filters(self):
         self.search_input.clear()
@@ -1204,8 +2659,14 @@ class InventoryWidget(BaseWidget):
 
     def update_stats(self):
         total_products = len(self.products_data)
-        low_stock = sum(1 for p in self.products_data if (p.get('current_stock', p.get('stock', 0)) or 0) <= (p.get('min_stock', 0) or 0) and p.get('min_stock', 0) > 0)
-        self.status_label.setText(f"✅ {total_products} کالا | ⚠️ {low_stock} کالا با موجودی کم")
+        low_stock = sum(
+            1 for p in self.products_data 
+            if (p.get('current_stock', p.get('stock', 0)) or 0) <= (p.get('min_stock', 0) or 0) 
+            and p.get('min_stock', 0) > 0
+        )
+        self.status_label.setText(
+            f"✅ {total_products} کالا | ⚠️ {low_stock} کالا با موجودی کم"
+        )
 
     def on_product_selected(self):
         row = self.products_table.currentRow()
@@ -1252,11 +2713,12 @@ class InventoryWidget(BaseWidget):
             with get_db() as conn:
                 c = conn.cursor()
 
-                # ✅ چک کن کجا استفاده شده
-                c.execute("SELECT COUNT(*) FROM stock_transactions WHERE product_id = ?", [product['id']])
+                c.execute("SELECT COUNT(*) FROM stock_transactions WHERE product_id = ?",
+                         [product['id']])
                 trans_count = c.fetchone()[0]
 
-                c.execute("SELECT COUNT(*) FROM document_items WHERE product_id = ?", [product['id']])
+                c.execute("SELECT COUNT(*) FROM document_items WHERE product_id = ?",
+                         [product['id']])
                 doc_count = c.fetchone()[0]
 
                 if trans_count > 0 or doc_count > 0:
@@ -1271,14 +2733,15 @@ class InventoryWidget(BaseWidget):
                         QMessageBox.Yes | QMessageBox.No
                     )
                     if reply2 == QMessageBox.Yes:
-                        c.execute("UPDATE products SET is_active = 0 WHERE id = ?", [product['id']])
+                        c.execute("UPDATE products SET is_active = 0 WHERE id = ?",
+                                 [product['id']])
                         conn.commit()
                         self.load_products()
                         QMessageBox.information(self, "موفق", "✅ کالا غیرفعال شد!")
                     return
 
-                # ✅ اگه استفاده نشده → حذف کامل
-                c.execute("DELETE FROM warehouse_stock WHERE product_id = ?", [product['id']])
+                c.execute("DELETE FROM warehouse_stock WHERE product_id = ?",
+                         [product['id']])
                 c.execute("DELETE FROM products WHERE id = ?", [product['id']])
                 conn.commit()
 
@@ -1317,16 +2780,29 @@ class InventoryWidget(BaseWidget):
             self.load_products()
             QMessageBox.information(self, "موفق", "✅ انبار مدیریت شد!")
 
+    # ✅ متد انبارگردانی
+    def open_inventory_count(self):
+        """باز کردن دیالوگ لیست اسناد انبارگردانی"""
+        dialog = InventoryCountListDialog(parent=self)
+        dialog.exec_()
+        # بعد از بستن، موجودی‌ها را بروزرسانی کن
+        self.load_products()
+
     def export_to_excel(self):
         file_name, _ = QFileDialog.getSaveFileName(
-            self, "ذخیره خروجی", f"inventory_{datetime.now().strftime('%Y%m%d')}.csv", "CSV Files (*.csv)"
+            self, "ذخیره خروجی",
+            f"inventory_{datetime.now().strftime('%Y%m%d')}.csv",
+            "CSV Files (*.csv)"
         )
         if not file_name:
             return
         try:
             with open(file_name, 'w', encoding='utf-8-sig', newline='') as f:
                 writer = csv.writer(f)
-                writer.writerow(["کد", "نام", "دسته", "برند", "مدل", "سایز", "رنگ", "واحد", "موجودی", "انبار", "قیمت خرید", "قیمت فروش", "ارزش"])
+                writer.writerow([
+                    "کد", "نام", "دسته", "برند", "مدل", "سایز", "رنگ", "واحد",
+                    "موجودی", "انبار", "قیمت خرید", "قیمت فروش", "ارزش"
+                ])
                 for p in self.products_data:
                     stock = p.get('current_stock', p.get('stock', 0)) or 0
                     value = p.get('stock_value', stock * (p.get('purchase_price', 0) or 0))
@@ -1348,3 +2824,28 @@ class InventoryWidget(BaseWidget):
             QMessageBox.information(self, "موفق", f"✅ خروجی در {file_name} ذخیره شد!")
         except Exception as e:
             QMessageBox.warning(self, "خطا", f"❌ خطا در ذخیره: {str(e)}")
+
+
+# ============================================================
+# تست
+# ============================================================
+
+if __name__ == "__main__":
+    import sys
+    from PyQt5.QtWidgets import QApplication
+    from database import DatabaseManager
+    
+    logging.basicConfig(level=logging.INFO)
+    
+    app = QApplication(sys.argv)
+    
+    # راه‌اندازی دیتابیس
+    DatabaseManager.init_db()
+    
+    # نمایش ویجت
+    widget = InventoryWidget(user_level='admin')
+    widget.resize(1200, 750)
+    widget.setWindowTitle("📦 انبارداری ImanAccount — تست")
+    widget.show()
+    
+    sys.exit(app.exec_())            

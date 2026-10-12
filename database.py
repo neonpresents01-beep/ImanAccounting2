@@ -1,30 +1,39 @@
 # database.py
 # ============================================================
-# دیتابیس ImanAccount - نسخه v6.1 (Inventory Fix)
+# دیتابیس ImanAccount - نسخه v10.0 (Migration-Based)
 # ============================================================
-#
-# تغییرات نسبت به v6.0:
-# ✅ رفع باگ update_warehouse_stock.subtract
-# ✅ حفظ created_at در بروزرسانی‌ها
-# ✅ سایر موارد v6.0 حفظ شد
+# تغییرات نسبت به v9.0:
+# ✅ جداول ماژولار به پوشه migrations/ منتقل شد
+# ✅ فقط جداول هسته در اینجا ساخته می‌شوند
+# ✅ استفاده از MigrationRegistry برای بقیه جداول
+# ✅ کد بسیار تمیزتر و قابل نگهداری
 # ============================================================
 
-import sqlite3
 import os
+import re
 import time
-import hashlib
-from datetime import datetime
+import json
+import sqlite3
+import logging
 from pathlib import Path
-from contextlib import contextmanager
-from typing import Optional, Dict, List, Tuple
+from datetime import datetime
+from contextlib import contextmanager, nullcontext
+from typing import Optional, Dict, List, Tuple, Any
+
+logger = logging.getLogger(__name__)
+
+
+# ============================================================
+# ========== ثابت‌های نسخه ==========
+# ============================================================
+
+SCHEMA_VERSION = 10
+MIN_SQLITE_VERSION = (3, 24, 0)
 
 
 # ============================================================
 # ========== بررسی نسخه SQLite ==========
 # ============================================================
-
-MIN_SQLITE_VERSION = (3, 24, 0)
-
 
 def check_sqlite_version() -> None:
     """بررسی حداقل نسخه SQLite موردنیاز"""
@@ -42,15 +51,7 @@ def check_sqlite_version() -> None:
 # ============================================================
 
 def _get_db_path() -> str:
-    """
-    دریافت مسیر امن دیتابیس
-
-    ترتیب اولویت:
-    1. متغیر محیطی IMANACCOUNT_DB_PATH
-    2. APPDATA/ImanAccount/accounting.db (ویندوز)
-    3. ~/.config/imanaccount/accounting.db (لینوکس)
-    4. ~/Documents/ImanAccount/accounting.db (fallback)
-    """
+    """دریافت مسیر امن دیتابیس"""
     env_path = os.environ.get('IMANACCOUNT_DB_PATH')
     if env_path:
         path = Path(env_path)
@@ -70,7 +71,6 @@ def _get_db_path() -> str:
             base = Path(xdg) / "imanaccount"
             base.mkdir(parents=True, exist_ok=True)
             return str(base / "accounting.db")
-
         home = Path.home()
         base = home / ".config" / "imanaccount"
         base.mkdir(parents=True, exist_ok=True)
@@ -86,7 +86,37 @@ DB_NAME = _get_db_path()
 
 
 # ============================================================
-# ========== تبدیل تاریخ ==========
+# ========== Context Manager ==========
+# ============================================================
+
+@contextmanager
+def get_db(timeout: float = 30.0):
+    """Context Manager برای اتصال به دیتابیس"""
+    conn = None
+    try:
+        conn = sqlite3.connect(DB_NAME, timeout=timeout)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA busy_timeout=60000")
+        conn.execute("PRAGMA foreign_keys=ON")
+        yield conn
+        conn.commit()
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        raise e
+    finally:
+        if conn:
+            try:
+                conn.execute("PRAGMA optimize")
+            except Exception:
+                pass
+            conn.close()
+
+
+# ============================================================
+# ========== DateConverter ==========
 # ============================================================
 
 class DateConverter:
@@ -231,48 +261,82 @@ class DateConverter:
 
 
 # ============================================================
-# ========== اتصال به دیتابیس ==========
+# ========== Migration Engine (Legacy) ==========
+# ============================================================
+# این Engine فقط برای Migration از دیتابیس‌های بسیار قدیمی است.
+# برای Migration های جدید، از MigrationRegistry استفاده می‌کنیم.
 # ============================================================
 
-@contextmanager
-def get_db(timeout: float = 30.0):
-    """
-    Context Manager برای اتصال به دیتابیس
-
-    Usage:
-        with get_db() as conn:
+class MigrationEngine:
+    """موتور Migration قدیمی - فقط برای سازگاری با دیتابیس‌های v0-v9"""
+    
+    @classmethod
+    def get_current_version(cls, conn) -> int:
+        try:
             c = conn.cursor()
-            c.execute(...)
-    """
-    conn = None
-    try:
-        conn = sqlite3.connect(DB_NAME, timeout=timeout)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute("PRAGMA busy_timeout=60000")
-        conn.execute("PRAGMA foreign_keys=ON")
-        yield conn
-        conn.commit()
-    except Exception as e:
-        if conn:
-            conn.rollback()
-        raise e
-    finally:
-        if conn:
-            try:
-                conn.execute("PRAGMA optimize")
-            except Exception:
-                pass
-            conn.close()
+            c.execute("""
+                CREATE TABLE IF NOT EXISTS db_version (
+                    version INTEGER PRIMARY KEY,
+                    applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    description TEXT
+                )
+            """)
+            c.execute("SELECT MAX(version) FROM db_version")
+            row = c.fetchone()
+            return row[0] if row and row[0] else 0
+        except Exception:
+            return 0
+    
+    @classmethod
+    def migrate(cls, conn) -> bool:
+        """اجرای Migration های قدیمی"""
+        current = cls.get_current_version(conn)
+        target = SCHEMA_VERSION
+        
+        if current >= target:
+            return True
+        
+        logger.info(f"🔄 Migration Engine: از v{current} به v{target}")
+        
+        for version in range(current + 1, target + 1):
+            migration_func = getattr(cls, f'_migrate_to_v{version}', None)
+            if migration_func:
+                try:
+                    logger.info(f"   → v{version}: {migration_func.__doc__ or ''}")
+                    migration_func(conn)
+                    cls._record_version(conn, version)
+                except Exception as e:
+                    logger.error(f"❌ خطا در Migration v{version}: {e}")
+                    return False
+        
+        return True
+    
+    @classmethod
+    def _record_version(cls, conn, version: int):
+        c = conn.cursor()
+        c.execute(
+            "INSERT OR REPLACE INTO db_version (version, description) VALUES (?, ?)",
+            [version, f"Migration to v{version}"]
+        )
+    
+    # Migration های قدیمی (فقط برای سازگاری)
+    @staticmethod
+    def _migrate_to_v10(conn):
+        """این نسخه توسط MigrationRegistry مدیریت می‌شود"""
+        pass
 
 
 # ============================================================
-# ========== مدیر دیتابیس ==========
+# ========== DatabaseManager ==========
 # ============================================================
 
 class DatabaseManager:
-    """مدیریت دیتابیس - ایجاد جداول و داده‌های اولیه"""
+    """
+    مدیریت دیتابیس - فقط جداول هسته.
+    
+    جداول ماژولار در پوشه migrations/ ساخته می‌شوند و
+    از طریق MigrationRegistry اجرا می‌شوند.
+    """
 
     @staticmethod
     def to_dict(row) -> Optional[Dict]:
@@ -282,650 +346,172 @@ class DatabaseManager:
 
     @staticmethod
     def init_db():
-        """راه‌اندازی دیتابیس با تمام جداول، ایندکس‌ها و داده‌های اولیه"""
+        """
+        راه‌اندازی دیتابیس.
+        
+        مراحل:
+        1. ساخت جداول هسته (companies, settings, users, accounts, vouchers)
+        2. Migration Engine (برای سازگاری با دیتابیس‌های قدیمی)
+        3. ثبت Migration های ماژولار
+        4. اجرای Migration های ماژولار
+        5. داده‌های پیش‌فرض
+        """
         check_sqlite_version()
-
+        
         with get_db() as conn:
-            c = conn.cursor()
-
-            # ============================================================
-            # ========== جداول اصلی ==========
-            # ============================================================
-
-            c.execute('''
-                CREATE TABLE IF NOT EXISTS companies (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    code TEXT UNIQUE NOT NULL,
-                    name TEXT NOT NULL,
-                    legal_name TEXT,
-                    is_active BOOLEAN DEFAULT 1,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-
-            c.execute('''
-                CREATE TABLE IF NOT EXISTS accounts (
-                    code TEXT PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    type TEXT NOT NULL,
-                    parent_code TEXT,
-                    level INTEGER DEFAULT 1,
-                    color TEXT,
-                    balance REAL DEFAULT 0,
-                    is_active BOOLEAN DEFAULT 1,
-                    company_id INTEGER DEFAULT 1,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-
-            c.execute('''
-                CREATE TABLE IF NOT EXISTS vouchers (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    voucher_no INTEGER UNIQUE,
-                    date TEXT NOT NULL,
-                    description TEXT,
-                    type TEXT DEFAULT 'عادی',
-                    status TEXT DEFAULT 'draft',
-                    created_by TEXT,
-                    approved_by TEXT,
-                    company_id INTEGER DEFAULT 1,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-
-            c.execute('''
-                CREATE TABLE IF NOT EXISTS voucher_items (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    voucher_id INTEGER,
-                    account_code TEXT,
-                    debit REAL DEFAULT 0,
-                    credit REAL DEFAULT 0,
-                    description TEXT,
-                    cost_center TEXT,
-                    project_code TEXT,
-                    FOREIGN KEY(voucher_id) REFERENCES vouchers(id) ON DELETE CASCADE,
-                    FOREIGN KEY(account_code) REFERENCES accounts(code)
-                )
-            ''')
-
-            # ============================================================
-            # ========== جداول انبار ==========
-            # ============================================================
-
-            c.execute('''
-                CREATE TABLE IF NOT EXISTS warehouses (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    code TEXT UNIQUE NOT NULL,
-                    name TEXT NOT NULL,
-                    address TEXT,
-                    manager TEXT,
-                    phone TEXT,
-                    is_default BOOLEAN DEFAULT 0,
-                    is_active BOOLEAN DEFAULT 1,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-
-            c.execute('''
-                CREATE TABLE IF NOT EXISTS products (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    code TEXT UNIQUE NOT NULL,
-                    name TEXT NOT NULL,
-                    unit TEXT DEFAULT 'عدد',
-                    stock REAL DEFAULT 0,
-                    purchase_price REAL DEFAULT 0,
-                    sale_price REAL DEFAULT 0,
-                    min_stock REAL DEFAULT 0,
-                    max_stock REAL DEFAULT 0,
-                    barcode TEXT,
-                    category TEXT,
-                    brand TEXT,
-                    model TEXT,
-                    color TEXT,
-                    size TEXT,
-                    weight REAL DEFAULT 0,
-                    has_serial BOOLEAN DEFAULT 0,
-                    expiry_date TEXT,
-                    location TEXT,
-                    warehouse_id INTEGER,
-                    company_id INTEGER DEFAULT 1,
-                    is_active BOOLEAN DEFAULT 1,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY(warehouse_id) REFERENCES warehouses(id)
-                )
-            ''')
-
-            c.execute('''
-                CREATE TABLE IF NOT EXISTS warehouse_stock (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    product_id INTEGER NOT NULL,
-                    warehouse_id INTEGER NOT NULL,
-                    quantity REAL DEFAULT 0,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE CASCADE,
-                    FOREIGN KEY(warehouse_id) REFERENCES warehouses(id) ON DELETE CASCADE,
-                    UNIQUE(product_id, warehouse_id)
-                )
-            ''')
-
-            c.execute('''
-                CREATE TABLE IF NOT EXISTS product_serials (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    product_id INTEGER NOT NULL,
-                    serial_number TEXT NOT NULL,
-                    warehouse_id INTEGER,
-                    status TEXT DEFAULT 'in_stock',
-                    purchase_date TEXT,
-                    purchase_price REAL DEFAULT 0,
-                    sell_date TEXT,
-                    sell_price REAL DEFAULT 0,
-                    customer_name TEXT,
-                    notes TEXT,
-                    FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE CASCADE,
-                    FOREIGN KEY(warehouse_id) REFERENCES warehouses(id),
-                    UNIQUE(product_id, serial_number)
-                )
-            ''')
-
-            c.execute('''
-                CREATE TABLE IF NOT EXISTS stock_transactions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    date TEXT NOT NULL,
-                    product_id INTEGER NOT NULL,
-                    warehouse_id INTEGER,
-                    from_warehouse_id INTEGER,
-                    to_warehouse_id INTEGER,
-                    type TEXT NOT NULL CHECK(type IN ('in', 'out', 'transfer')),
-                    quantity REAL NOT NULL,
-                    unit_price REAL DEFAULT 0,
-                    total_price REAL DEFAULT 0,
-                    ref_no TEXT,
-                    description TEXT,
-                    serial_numbers TEXT,
-                    expiry_date TEXT,
-                    created_by TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY(product_id) REFERENCES products(id) ON DELETE CASCADE,
-                    FOREIGN KEY(warehouse_id) REFERENCES warehouses(id),
-                    FOREIGN KEY(from_warehouse_id) REFERENCES warehouses(id),
-                    FOREIGN KEY(to_warehouse_id) REFERENCES warehouses(id)
-                )
-            ''')
-
-            # ============================================================
-            # ========== جداول حقوق ==========
-            # ============================================================
-
-            c.execute('''
-                CREATE TABLE IF NOT EXISTS employees (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    code TEXT UNIQUE NOT NULL,
-                    name TEXT NOT NULL,
-                    national_code TEXT,
-                    insurance_code TEXT,
-                    position TEXT,
-                    department TEXT,
-                    hire_date TEXT,
-                    base_salary INTEGER DEFAULT 0,
-                    child_count INTEGER DEFAULT 0,
-                    spouse_allowance INTEGER DEFAULT 0,
-                    meal_allowance INTEGER DEFAULT 0,
-                    housing_allowance INTEGER DEFAULT 0,
-                    responsibility_pay INTEGER DEFAULT 0,
-                    overtime_rate REAL DEFAULT 1.5,
-                    night_work_rate REAL DEFAULT 0.35,
-                    friday_work_rate REAL DEFAULT 1.5,
-                    shift_allowance_rate REAL DEFAULT 0.1,
-                    hardship_rate REAL DEFAULT 0,
-                    insurance_premium REAL DEFAULT 0.07,
-                    loan_installment INTEGER DEFAULT 0,
-                    is_active BOOLEAN DEFAULT 1,
-                    company_id INTEGER DEFAULT 1,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    head_of_household_allowance INTEGER DEFAULT 0,
-                    supplemental_insurance INTEGER DEFAULT 0,
-                    holiday_work_rate REAL DEFAULT 1.5,
-                    bonus INTEGER DEFAULT 0,
-                    mission_allowance INTEGER DEFAULT 0,
-                    advance_payment INTEGER DEFAULT 0,
-                    deduction INTEGER DEFAULT 0,
-                    penalty INTEGER DEFAULT 0,
-                    tax_rate REAL DEFAULT 0.1,
-                    seniority_pay INTEGER DEFAULT 0
-                )
-            ''')
-
-            c.execute('''
-                CREATE TABLE IF NOT EXISTS payrolls (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    employee_id INTEGER NOT NULL,
-                    year INTEGER NOT NULL,
-                    month INTEGER NOT NULL,
-                    work_days INTEGER DEFAULT 0,
-                    overtime_hours REAL DEFAULT 0,
-                    night_work_hours REAL DEFAULT 0,
-                    friday_work_hours REAL DEFAULT 0,
-                    shift_days INTEGER DEFAULT 0,
-                    base_salary INTEGER DEFAULT 0,
-                    child_allowance INTEGER DEFAULT 0,
-                    spouse_allowance INTEGER DEFAULT 0,
-                    housing_allowance INTEGER DEFAULT 0,
-                    meal_allowance INTEGER DEFAULT 0,
-                    seniority_pay INTEGER DEFAULT 0,
-                    overtime_pay INTEGER DEFAULT 0,
-                    night_work_pay INTEGER DEFAULT 0,
-                    friday_work_pay INTEGER DEFAULT 0,
-                    shift_allowance INTEGER DEFAULT 0,
-                    responsibility_pay INTEGER DEFAULT 0,
-                    bonus INTEGER DEFAULT 0,
-                    performance_bonus INTEGER DEFAULT 0,
-                    mission_allowance INTEGER DEFAULT 0,
-                    loan_installment INTEGER DEFAULT 0,
-                    advance_payment INTEGER DEFAULT 0,
-                    deduction INTEGER DEFAULT 0,
-                    penalty INTEGER DEFAULT 0,
-                    gross_salary INTEGER DEFAULT 0,
-                    insurance_employee INTEGER DEFAULT 0,
-                    insurance_employer INTEGER DEFAULT 0,
-                    legal_deductions INTEGER DEFAULT 0,
-                    tax INTEGER DEFAULT 0,
-                    net_salary INTEGER DEFAULT 0,
-                    payment_status TEXT DEFAULT 'pending',
-                    payment_date TEXT,
-                    FOREIGN KEY(employee_id) REFERENCES employees(id) ON DELETE CASCADE,
-                    UNIQUE(employee_id, year, month)
-                )
-            ''')
-
-            c.execute('''
-                CREATE TABLE IF NOT EXISTS payroll_settings (
-                    year INTEGER PRIMARY KEY,
-                    daily_minimum_wage INTEGER DEFAULT 2650000,
-                    base_seniority_pay INTEGER DEFAULT 2100000,
-                    child_allowance_per_child INTEGER DEFAULT 15000000,
-                    housing_allowance INTEGER DEFAULT 15000000,
-                    meal_allowance INTEGER DEFAULT 14000000,
-                    tax_rate REAL DEFAULT 0.10,
-                    insurance_employee_rate REAL DEFAULT 0.07,
-                    insurance_employer_rate REAL DEFAULT 0.23,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-
-            c.execute('''
-                CREATE TABLE IF NOT EXISTS payroll_items (
-                    code TEXT PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    type TEXT CHECK(type IN ('fixed', 'percent')),
-                    value REAL DEFAULT 0,
-                    unit TEXT,
-                    category TEXT DEFAULT 'benefit'
-                )
-            ''')
-
-            # ============================================================
-            # ========== جداول اشخاص و اسناد ==========
-            # ============================================================
-
-            c.execute('''
-                CREATE TABLE IF NOT EXISTS parties (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    code TEXT UNIQUE,
-                    name TEXT NOT NULL,
-                    company TEXT,
-                    phone TEXT,
-                    mobile TEXT,
-                    email TEXT,
-                    address TEXT,
-                    economic_code TEXT,
-                    national_id TEXT,
-                    type TEXT CHECK(type IN ('customer', 'supplier')),
-                    balance INTEGER DEFAULT 0,
-                    company_id INTEGER DEFAULT 1,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-
-            c.execute('''
-                CREATE TABLE IF NOT EXISTS party_transactions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    party_id INTEGER NOT NULL,
-                    date TEXT NOT NULL,
-                    type TEXT CHECK(type IN ('debit', 'credit')),
-                    amount INTEGER NOT NULL,
-                    description TEXT,
-                    voucher_id INTEGER,
-                    FOREIGN KEY(party_id) REFERENCES parties(id) ON DELETE CASCADE
-                )
-            ''')
-
-            c.execute('''
-                CREATE TABLE IF NOT EXISTS documents (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    doc_no TEXT UNIQUE NOT NULL,
-                    doc_type TEXT CHECK(doc_type IN ('sales', 'purchase')),
-                    date TEXT NOT NULL,
-                    party_id INTEGER NOT NULL,
-                    total_amount INTEGER DEFAULT 0,
-                    discount INTEGER DEFAULT 0,
-                    tax INTEGER DEFAULT 0,
-                    net_amount INTEGER DEFAULT 0,
-                    description TEXT,
-                    status TEXT DEFAULT 'pending',
-                    company_id INTEGER DEFAULT 1,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY(party_id) REFERENCES parties(id)
-                )
-            ''')
-
-            c.execute('''
-                CREATE TABLE IF NOT EXISTS document_items (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    document_id INTEGER NOT NULL,
-                    product_id INTEGER NOT NULL,
-                    quantity REAL NOT NULL,
-                    unit_price INTEGER NOT NULL,
-                    total_price INTEGER NOT NULL,
-                    description TEXT,
-                    FOREIGN KEY(document_id) REFERENCES documents(id) ON DELETE CASCADE,
-                    FOREIGN KEY(product_id) REFERENCES products(id)
-                )
-            ''')
-
-            c.execute('''
-                CREATE TABLE IF NOT EXISTS invoices (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    invoice_no TEXT UNIQUE NOT NULL,
-                    date TEXT NOT NULL,
-                    party_id INTEGER NOT NULL,
-                    total_amount INTEGER DEFAULT 0,
-                    discount INTEGER DEFAULT 0,
-                    tax INTEGER DEFAULT 0,
-                    net_amount INTEGER DEFAULT 0,
-                    description TEXT,
-                    status TEXT DEFAULT 'pending',
-                    company_id INTEGER DEFAULT 1,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY(party_id) REFERENCES parties(id)
-                )
-            ''')
-
-            c.execute('''
-                CREATE TABLE IF NOT EXISTS invoice_items (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    invoice_id INTEGER NOT NULL,
-                    product_id INTEGER NOT NULL,
-                    quantity REAL NOT NULL,
-                    unit_price INTEGER NOT NULL,
-                    total_price INTEGER NOT NULL,
-                    description TEXT,
-                    FOREIGN KEY(invoice_id) REFERENCES invoices(id) ON DELETE CASCADE,
-                    FOREIGN KEY(product_id) REFERENCES products(id)
-                )
-            ''')
-
-            c.execute('''
-                CREATE TABLE IF NOT EXISTS purchase_orders (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    order_no TEXT UNIQUE NOT NULL,
-                    date TEXT NOT NULL,
-                    party_id INTEGER NOT NULL,
-                    total_amount INTEGER DEFAULT 0,
-                    discount INTEGER DEFAULT 0,
-                    tax INTEGER DEFAULT 0,
-                    net_amount INTEGER DEFAULT 0,
-                    description TEXT,
-                    status TEXT DEFAULT 'pending',
-                    company_id INTEGER DEFAULT 1,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY(party_id) REFERENCES parties(id)
-                )
-            ''')
-
-            c.execute('''
-                CREATE TABLE IF NOT EXISTS purchase_order_items (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    order_id INTEGER NOT NULL,
-                    product_id INTEGER NOT NULL,
-                    quantity REAL NOT NULL,
-                    unit_price INTEGER NOT NULL,
-                    total_price INTEGER NOT NULL,
-                    description TEXT,
-                    FOREIGN KEY(order_id) REFERENCES purchase_orders(id) ON DELETE CASCADE,
-                    FOREIGN KEY(product_id) REFERENCES products(id)
-                )
-            ''')
-
-            # ============================================================
-            # ========== جداول تنظیمات و کاربران ==========
-            # ============================================================
-
-            c.execute('''
-                CREATE TABLE IF NOT EXISTS settings (
-                    key TEXT PRIMARY KEY,
-                    value TEXT
-                )
-            ''')
-
-            c.execute('''
-                CREATE TABLE IF NOT EXISTS users (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    username TEXT UNIQUE NOT NULL,
-                    password_hash TEXT NOT NULL,
-                    full_name TEXT,
-                    level TEXT DEFAULT 'viewer',
-                    is_active BOOLEAN DEFAULT 1,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    last_login TIMESTAMP
-                )
-            ''')
-
-            # ============================================================
-            # ✅ جداول پلاگین مودیان
-            # ============================================================
-
-            c.execute('''
-                CREATE TABLE IF NOT EXISTS moadian_settings (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    customer_id TEXT UNIQUE NOT NULL,
-                    fiscal_id TEXT,
-                    economic_code TEXT,
-                    private_key_path TEXT,
-                    certificate_path TEXT,
-                    is_sandbox BOOLEAN DEFAULT 1,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-
-            c.execute('''
-                CREATE TABLE IF NOT EXISTS moadian_invoices (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    customer_id TEXT NOT NULL,
-                    taxid TEXT UNIQUE NOT NULL,
-                    reference_number TEXT,
-                    uid TEXT,
-                    invoice_type TEXT DEFAULT 'normal',
-                    invoice_data TEXT,
-                    status TEXT DEFAULT 'pending',
-                    response_data TEXT,
-                    retry_count INTEGER DEFAULT 0,
-                    sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-
-            c.execute('''
-                CREATE TABLE IF NOT EXISTS moadian_logs (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    customer_id TEXT,
-                    endpoint TEXT,
-                    request_data TEXT,
-                    response_data TEXT,
-                    status_code INTEGER,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-
-            c.execute('''
-                CREATE TABLE IF NOT EXISTS moadian_serial (
-                    customer_id TEXT PRIMARY KEY,
-                    last_serial INTEGER DEFAULT 0,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-
-            # ============================================================
-            # ✅ ایندکس‌های کارایی
-            # ============================================================
-
-            indexes = [
-                "CREATE INDEX IF NOT EXISTS idx_vouchers_date ON vouchers(date)",
-                "CREATE INDEX IF NOT EXISTS idx_vouchers_type ON vouchers(type)",
-                "CREATE INDEX IF NOT EXISTS idx_vouchers_status ON vouchers(status)",
-                "CREATE INDEX IF NOT EXISTS idx_voucher_items_voucher ON voucher_items(voucher_id)",
-                "CREATE INDEX IF NOT EXISTS idx_voucher_items_account ON voucher_items(account_code)",
-                "CREATE INDEX IF NOT EXISTS idx_accounts_type ON accounts(type)",
-                "CREATE INDEX IF NOT EXISTS idx_accounts_parent ON accounts(parent_code)",
-                "CREATE INDEX IF NOT EXISTS idx_products_code ON products(code)",
-                "CREATE INDEX IF NOT EXISTS idx_products_name ON products(name)",
-                "CREATE INDEX IF NOT EXISTS idx_products_category ON products(category)",
-                "CREATE INDEX IF NOT EXISTS idx_products_barcode ON products(barcode)",
-                "CREATE INDEX IF NOT EXISTS idx_products_warehouse ON products(warehouse_id)",
-                "CREATE INDEX IF NOT EXISTS idx_warehouse_stock_product ON warehouse_stock(product_id)",
-                "CREATE INDEX IF NOT EXISTS idx_warehouse_stock_warehouse ON warehouse_stock(warehouse_id)",
-                "CREATE INDEX IF NOT EXISTS idx_stock_trans_date ON stock_transactions(date)",
-                "CREATE INDEX IF NOT EXISTS idx_stock_trans_product ON stock_transactions(product_id)",
-                "CREATE INDEX IF NOT EXISTS idx_stock_trans_type ON stock_transactions(type)",
-                "CREATE INDEX IF NOT EXISTS idx_documents_date ON documents(date)",
-                "CREATE INDEX IF NOT EXISTS idx_documents_type ON documents(doc_type)",
-                "CREATE INDEX IF NOT EXISTS idx_documents_party ON documents(party_id)",
-                "CREATE INDEX IF NOT EXISTS idx_document_items_doc ON document_items(document_id)",
-                "CREATE INDEX IF NOT EXISTS idx_document_items_product ON document_items(product_id)",
-                "CREATE INDEX IF NOT EXISTS idx_invoices_date ON invoices(date)",
-                "CREATE INDEX IF NOT EXISTS idx_invoices_party ON invoices(party_id)",
-                "CREATE INDEX IF NOT EXISTS idx_purchase_orders_date ON purchase_orders(date)",
-                "CREATE INDEX IF NOT EXISTS idx_purchase_orders_party ON purchase_orders(party_id)",
-                "CREATE INDEX IF NOT EXISTS idx_payrolls_employee ON payrolls(employee_id)",
-                "CREATE INDEX IF NOT EXISTS idx_payrolls_year_month ON payrolls(year, month)",
-                "CREATE INDEX IF NOT EXISTS idx_payrolls_status ON payrolls(payment_status)",
-                "CREATE INDEX IF NOT EXISTS idx_employees_code ON employees(code)",
-                "CREATE INDEX IF NOT EXISTS idx_employees_active ON employees(is_active)",
-                "CREATE INDEX IF NOT EXISTS idx_parties_type ON parties(type)",
-                "CREATE INDEX IF NOT EXISTS idx_parties_code ON parties(code)",
-                "CREATE INDEX IF NOT EXISTS idx_parties_name ON parties(name)",
-                "CREATE INDEX IF NOT EXISTS idx_party_trans_party ON party_transactions(party_id)",
-                "CREATE INDEX IF NOT EXISTS idx_party_trans_date ON party_transactions(date)",
-                "CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)",
-                "CREATE INDEX IF NOT EXISTS idx_moadian_inv_customer ON moadian_invoices(customer_id)",
-                "CREATE INDEX IF NOT EXISTS idx_moadian_inv_status ON moadian_invoices(status)",
-                "CREATE INDEX IF NOT EXISTS idx_moadian_inv_taxid ON moadian_invoices(taxid)",
-                "CREATE INDEX IF NOT EXISTS idx_moadian_inv_sent_at ON moadian_invoices(sent_at)",
-                "CREATE INDEX IF NOT EXISTS idx_moadian_logs_customer ON moadian_logs(customer_id)",
-                "CREATE INDEX IF NOT EXISTS idx_moadian_logs_created ON moadian_logs(created_at)",
-            ]
-
-            for idx_sql in indexes:
-                c.execute(idx_sql)
-
-            # ============================================================
-            # ========== درج داده‌های پیش‌فرض ==========
-            # ============================================================
-
-            c.execute('INSERT OR IGNORE INTO companies (code, name) VALUES ("001", "شرکت اصلی")')
-
-            default_accounts = [
-                ('1101', 'صندوق', 'asset', None, 1),
-                ('1102', 'بانک', 'asset', None, 1),
-                ('1103', 'حساب‌های دریافتنی', 'asset', None, 1),
-                ('1104', 'موجودی کالا', 'asset', None, 1),
-                ('2101', 'حساب‌های پرداختنی', 'liability', None, 1),
-                ('3101', 'سرمایه', 'equity', None, 1),
-                ('4101', 'فروش کالا', 'income', None, 1),
-                ('5101', 'خرید کالا', 'expense', None, 1),
-                ('5102', 'هزینه حقوق', 'expense', None, 1),
-            ]
-            for acc in default_accounts:
-                c.execute(
-                    'INSERT OR IGNORE INTO accounts (code, name, type, parent_code, is_active) VALUES (?, ?, ?, ?, ?)',
-                    acc
-                )
-
-            default_settings = [
-                ('company_name', 'شرکت حسابداری پارسه'),
-                ('currency', 'ریال'),
-                ('tax_rate', '10'),
-                ('date_system', 'شمسی'),
-                ('valuation_method', 'simple'),
-            ]
-            for key, value in default_settings:
-                c.execute('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)', (key, value))
-
-            c.execute('''
-                INSERT OR IGNORE INTO payroll_settings
-                (year, daily_minimum_wage, base_seniority_pay, child_allowance_per_child,
-                 housing_allowance, meal_allowance)
-                VALUES (1404, 2650000, 2100000, 15000000, 15000000, 14000000)
-            ''')
-
-            default_payroll_items = [
-                ('OVERTIME', 'اضافه کاری', 'percent', 1.5, 'برابر', 'benefit'),
-                ('NIGHT', 'شب کاری', 'percent', 0.35, 'درصد', 'benefit'),
-                ('FRIDAY', 'جمعه کاری', 'percent', 1.5, 'برابر', 'benefit'),
-                ('SHIFT', 'نوبت کاری', 'percent', 0.1, 'درصد', 'benefit'),
-                ('CHILD', 'حق اولاد', 'fixed', 0, 'ریال', 'benefit'),
-                ('HOUSING', 'حق مسکن', 'fixed', 0, 'ریال', 'benefit'),
-                ('MEAL', 'بن کارگری', 'fixed', 0, 'ریال', 'benefit'),
-                ('SENIORITY', 'پایه سنوات', 'fixed', 0, 'ریال', 'benefit'),
-                ('SPOUSE', 'حق همسر', 'fixed', 0, 'ریال', 'benefit'),
-                ('RESPONSIBILITY', 'حق مسئولیت', 'fixed', 0, 'ریال', 'benefit'),
-                ('BONUS', 'پاداش', 'fixed', 0, 'ریال', 'benefit'),
-                ('MISSION', 'حق ماموریت', 'fixed', 0, 'ریال', 'benefit'),
-                ('INSURANCE', 'بیمه سهم کارمند', 'percent', 0.07, 'درصد', 'deduction'),
-                ('TAX', 'مالیات بر درآمد', 'percent', 0.1, 'درصد', 'deduction'),
-                ('LOAN', 'قسط وام', 'fixed', 0, 'ریال', 'deduction'),
-                ('ADVANCE', 'مساعده', 'fixed', 0, 'ریال', 'deduction'),
-                ('DEDUCTION', 'سایر کسورات', 'fixed', 0, 'ریال', 'deduction'),
-                ('PENALTY', 'جریمه', 'fixed', 0, 'ریال', 'deduction'),
-            ]
-            for item in default_payroll_items:
-                c.execute('''
-                    INSERT OR IGNORE INTO payroll_items (code, name, type, value, unit, category)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                ''', item)
-
-            default_parties = [
-                ('CUST00001', 'مشتری نقدی', None, None, None, None, None, None, None, 'customer'),
-                ('SUPP00001', 'تأمین‌کننده نمونه', None, None, None, None, None, None, None, 'supplier'),
-            ]
-            for party in default_parties:
-                c.execute('''
-                    INSERT OR IGNORE INTO parties
-                    (code, name, company, phone, mobile, email, address, economic_code, national_id, type)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''', party)
-
-            c.execute('''
-                INSERT OR IGNORE INTO products (code, name, unit, purchase_price, sale_price)
-                VALUES ("KALA001", "کالای نمونه", "عدد", 0, 0)
-            ''')
-
-            c.execute('''
-                INSERT OR IGNORE INTO warehouses (code, name, is_default, is_active)
-                VALUES ('WH-001', 'انبار اصلی', 1, 1)
-            ''')
-
+            # ─── ۱. جداول هسته ───
+            DatabaseManager._create_core_tables(conn)
             conn.commit()
-
-            print(f"✅ دیتابیس v6.1 آماده است - مسیر: {DB_NAME}")
+            
+            # ─── ۲. Migration Engine (Legacy) ───
+            MigrationEngine.migrate(conn)
+            conn.commit()
+            
+            # ─── ۳. ثبت Migration های ماژولار ───
+            try:
+                from migrations import register_all_migrations
+                loaded, failed = register_all_migrations()
+                logger.info(f"📋 {len(loaded)} ماژول Migration بارگذاری شد")
+                if failed:
+                    for module_name, error in failed:
+                        logger.warning(f"   ⚠️ {module_name}: {error}")
+            except Exception as e:
+                logger.error(f"❌ خطا در ثبت Migration ها: {e}", exc_info=True)
+            
+            # ─── ۴. اجرای Migration های ماژولار ───
+            try:
+                from migration_registry import get_migration_registry
+                registry = get_migration_registry()
+                result = registry.run_all(conn)
+                conn.commit()
+                
+                if result['failed']:
+                    logger.error(f"❌ {len(result['failed'])} Migration با خطا مواجه شد")
+                    for name, error in result['failed']:
+                        logger.error(f"   • {name}: {error}")
+            except Exception as e:
+                logger.error(f"❌ خطا در اجرای Migration ها: {e}", exc_info=True)
+            
+            # ─── ۵. نسخه نهایی ───
+            version = MigrationEngine.get_current_version(conn)
+            
+            print(f"✅ دیتابیس v{version} آماده است - مسیر: {DB_NAME}")
             print(f"📅 سیستم تاریخ: {DateConverter.get_date_system()}")
-            print(f"✅ {len(indexes)} ایندکس ایجاد/بررسی شد")
+
+    # ═══════════════════════════════════════════════════════
+    # جداول هسته — فقط جداول پایه بدون وابستگی
+    # ═══════════════════════════════════════════════════════
+    
+    @staticmethod
+    def _create_core_tables(conn):
+        """
+        ساخت جداول هسته.
+        
+        این جداول توسط MigrationRegistry هم قابل ساخت هستند،
+        اما برای اطمینان و سازگاری، اینجا هم ساخته می‌شوند.
+        """
+        c = conn.cursor()
+        
+        # ─── companies ───
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS companies (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                code TEXT UNIQUE NOT NULL,
+                name TEXT NOT NULL,
+                legal_name TEXT,
+                is_active BOOLEAN DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # ─── settings ───
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        ''')
+        
+        # ─── users ───
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                full_name TEXT,
+                level TEXT DEFAULT 'viewer',
+                is_active BOOLEAN DEFAULT 1,
+                must_change_password INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_login TIMESTAMP
+            )
+        ''')
+        
+        # ─── accounts ───
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS accounts (
+                code TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                type TEXT NOT NULL,
+                parent_code TEXT,
+                level INTEGER DEFAULT 1,
+                color TEXT,
+                balance REAL DEFAULT 0,
+                is_active BOOLEAN DEFAULT 1,
+                company_id INTEGER DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # ─── vouchers ───
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS vouchers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                voucher_no INTEGER UNIQUE,
+                date TEXT NOT NULL,
+                description TEXT,
+                type TEXT DEFAULT 'عادی',
+                status TEXT DEFAULT 'draft',
+                created_by TEXT,
+                approved_by TEXT,
+                company_id INTEGER DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # ─── voucher_items ───
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS voucher_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                voucher_id INTEGER,
+                account_code TEXT,
+                debit REAL DEFAULT 0,
+                credit REAL DEFAULT 0,
+                description TEXT,
+                cost_center TEXT,
+                project_code TEXT,
+                FOREIGN KEY(voucher_id) REFERENCES vouchers(id) ON DELETE CASCADE,
+                FOREIGN KEY(account_code) REFERENCES accounts(code)
+            )
+        ''')
+        
+        # ─── ایندکس‌های هسته ───
+        for idx in [
+            "CREATE INDEX IF NOT EXISTS idx_vouchers_date ON vouchers(date)",
+            "CREATE INDEX IF NOT EXISTS idx_vouchers_type ON vouchers(type)",
+            "CREATE INDEX IF NOT EXISTS idx_vouchers_status ON vouchers(status)",
+            "CREATE INDEX IF NOT EXISTS idx_voucher_items_voucher ON voucher_items(voucher_id)",
+            "CREATE INDEX IF NOT EXISTS idx_voucher_items_account ON voucher_items(account_code)",
+            "CREATE INDEX IF NOT EXISTS idx_accounts_type ON accounts(type)",
+            "CREATE INDEX IF NOT EXISTS idx_accounts_parent ON accounts(parent_code)",
+            "CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)",
+        ]:
+            c.execute(idx)
 
 
 # ============================================================
-# ========== کلاس‌های کمکی ==========
+# ========== AccountingHelper ==========
 # ============================================================
 
 class AccountingHelper:
@@ -1002,97 +588,582 @@ class AccountingHelper:
             return c.fetchone()[0] or 0
 
 
+# ============================================================
+# ========== InventoryHelper ==========
+# ============================================================
+
 class InventoryHelper:
-    """کلاس کمکی برای عملیات انبار"""
-
+    """
+    کلاس کمکی برای عملیات انبار.
+    
+    تابع مرکزی adjust_stock همه تغییرات موجودی را مدیریت می‌کند.
+    """
+    
     @staticmethod
-    def update_stock(product_id: int, quantity: float, transaction_type: str):
-        with get_db(timeout=10.0) as conn:
+    def adjust_stock(product_id: int, quantity: float, transaction_type: str,
+                     warehouse_id: int = None, conn=None) -> bool:
+        """
+        تنظیم موجودی کالا در هر دو جدول products و warehouse_stock.
+        
+        Args:
+            product_id: شناسه کالا
+            quantity: مقدار (همیشه مثبت)
+            transaction_type: 'in' (ورود) | 'out' (خروج)
+            warehouse_id: شناسه انبار (اگر None باشد، انبار پیش‌فرض)
+            conn: اتصال موجود (اختیاری)
+        
+        Returns:
+            bool: موفقیت
+        """
+        if quantity <= 0:
+            logger.warning(f"⚠️ quantity باید مثبت باشد: {quantity}")
+            return False
+        
+        if transaction_type not in ('in', 'out'):
+            logger.error(f"❌ transaction_type نامعتبر: {transaction_type}")
+            return False
+        
+        if conn is None:
+            ctx = get_db(timeout=10.0)
+            should_close = True
+        else:
+            ctx = nullcontext(conn)
+            should_close = False
+        
+        try:
+            with ctx as c:
+                # ─── ۱. تعیین انبار ───
+                if warehouse_id is None:
+                    warehouse_id = InventoryHelper._get_default_warehouse_id(c)
+                
+                if warehouse_id is None:
+                    logger.warning("⚠️ هیچ انبار فعالی وجود ندارد")
+                    return False
+                
+                # ─── ۲. محاسبه delta ───
+                delta = quantity if transaction_type == 'in' else -quantity
+                
+                # ─── ۳. اطمینان از وجود رکورد در warehouse_stock ───
+                c.execute("""
+                    INSERT INTO warehouse_stock (product_id, warehouse_id, quantity, updated_at)
+                    VALUES (?, ?, 0, CURRENT_TIMESTAMP)
+                    ON CONFLICT(product_id, warehouse_id) DO NOTHING
+                """, [product_id, warehouse_id])
+                
+                # ─── ۴. به‌روزرسانی warehouse_stock ───
+                c.execute("""
+                    UPDATE warehouse_stock 
+                    SET quantity = MAX(0, quantity + ?), 
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE product_id = ? AND warehouse_id = ?
+                """, [delta, product_id, warehouse_id])
+                
+                # ─── ۵. به‌روزرسانی products.stock ───
+                c.execute("""
+                    UPDATE products 
+                    SET stock = (
+                        SELECT COALESCE(SUM(quantity), 0) 
+                        FROM warehouse_stock 
+                        WHERE product_id = ?
+                    ),
+                    updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                """, [product_id, product_id])
+                
+                return True
+        
+        except Exception as e:
+            logger.error(f"❌ خطا در adjust_stock: {e}", exc_info=True)
+            return False
+    
+    @staticmethod
+    def _get_default_warehouse_id(conn) -> Optional[int]:
+        """دریافت شناسه انبار پیش‌فرض"""
+        c = conn.cursor()
+        
+        c.execute("""
+            SELECT id FROM warehouses 
+            WHERE is_default = 1 AND is_active = 1 
+            LIMIT 1
+        """)
+        row = c.fetchone()
+        if row:
+            return row['id'] if hasattr(row, 'keys') else row[0]
+        
+        c.execute("""
+            SELECT id FROM warehouses 
+            WHERE is_active = 1 
+            ORDER BY id LIMIT 1
+        """)
+        row = c.fetchone()
+        if row:
+            return row['id'] if hasattr(row, 'keys') else row[0]
+        
+        return None
+    
+    @staticmethod
+    def get_stock(product_id: int, warehouse_id: int = None) -> float:
+        """خواندن موجودی کالا"""
+        with get_db() as conn:
             c = conn.cursor()
-            if transaction_type == 'in':
-                c.execute('UPDATE products SET stock = stock + ? WHERE id = ?', (quantity, product_id))
+            
+            if warehouse_id is None:
+                c.execute("""
+                    SELECT COALESCE(SUM(quantity), 0) 
+                    FROM warehouse_stock 
+                    WHERE product_id = ?
+                """, [product_id])
             else:
-                c.execute('UPDATE products SET stock = stock - ? WHERE id = ?', (quantity, product_id))
-
+                c.execute("""
+                    SELECT COALESCE(quantity, 0) 
+                    FROM warehouse_stock 
+                    WHERE product_id = ? AND warehouse_id = ?
+                """, [product_id, warehouse_id])
+            
+            row = c.fetchone()
+            return float(row[0]) if row and row[0] else 0.0
+    
+    @staticmethod
+    def get_product_stock(product_id: int) -> float:
+        """خواندن موجودی کل کالا از جدول products"""
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute("SELECT stock FROM products WHERE id = ?", [product_id])
+            row = c.fetchone()
+            return float(row[0]) if row and row[0] else 0.0
+    
+    @staticmethod
+    def get_warehouse_stock(product_id: int, warehouse_id: int = None) -> float:
+        """خواندن موجودی از warehouse_stock"""
+        return InventoryHelper.get_stock(product_id, warehouse_id)
+    
     @staticmethod
     def get_low_stock_products() -> List:
+        """دریافت کالاهای زیر حداقل موجودی"""
         with get_db() as conn:
             c = conn.cursor()
             c.execute('''
                 SELECT * FROM products
-                WHERE stock <= min_stock AND min_stock > 0
+                WHERE stock <= min_stock AND min_stock > 0 AND is_active = 1
                 ORDER BY stock ASC
             ''')
             return c.fetchall()
+    
+    @staticmethod
+    def sync_product_stock(product_id: int, conn=None) -> bool:
+        """همگام‌سازی products.stock با مجموع warehouse_stock"""
+        if conn is None:
+            ctx = get_db(timeout=10.0)
+        else:
+            ctx = nullcontext(conn)
+        
+        try:
+            with ctx as c:
+                c.execute("""
+                    UPDATE products 
+                    SET stock = (
+                        SELECT COALESCE(SUM(quantity), 0) 
+                        FROM warehouse_stock 
+                        WHERE product_id = ?
+                    ),
+                    updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                """, [product_id, product_id])
+                return True
+        except Exception as e:
+            logger.error(f"❌ خطا در sync_product_stock: {e}")
+            return False
+    
+    @staticmethod
+    def sync_all_products(conn=None) -> int:
+        """همگام‌سازی همه کالاها"""
+        if conn is None:
+            ctx = get_db(timeout=30.0)
+        else:
+            ctx = nullcontext(conn)
+        
+        try:
+            with ctx as c:
+                c.execute("SELECT id FROM products")
+                product_ids = [row[0] if not hasattr(row, 'keys') else row['id'] 
+                              for row in c.fetchall()]
+                
+                count = 0
+                for pid in product_ids:
+                    c.execute("""
+                        UPDATE products 
+                        SET stock = (
+                            SELECT COALESCE(SUM(quantity), 0) 
+                            FROM warehouse_stock 
+                            WHERE product_id = ?
+                        ),
+                        updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ?
+                    """, [pid, pid])
+                    count += 1
+                
+                logger.info(f"✅ {count} کالا همگام‌سازی شد")
+                return count
+        except Exception as e:
+            logger.error(f"❌ خطا در sync_all_products: {e}")
+            return 0
+    
+    @staticmethod
+    def update_stock(product_id: int, quantity: float, transaction_type: str):
+        """سازگاری با کد قدیم"""
+        return InventoryHelper.adjust_stock(product_id, quantity, transaction_type)
+
+
+# ============================================================
+# ========== FinanceHelper ==========
+# ============================================================
+
+class FinanceHelper:
+    """کلاس کمکی برای عملیات امور مالی"""
 
     @staticmethod
-    def get_warehouse_stock(product_id: int, warehouse_id: int = None) -> float:
+    def get_total_balance() -> Dict[str, int]:
         with get_db() as conn:
             c = conn.cursor()
-            if warehouse_id:
-                c.execute(
-                    "SELECT quantity FROM warehouse_stock WHERE product_id = ? AND warehouse_id = ?",
-                    [product_id, warehouse_id]
-                )
+            c.execute("SELECT COALESCE(SUM(balance), 0) FROM banks WHERE is_active = 1")
+            bank_total = c.fetchone()[0] or 0
+            c.execute("SELECT COALESCE(SUM(balance), 0) FROM cash_boxes WHERE is_active = 1")
+            cash_total = c.fetchone()[0] or 0
+            return {
+                'banks': bank_total,
+                'cash': cash_total,
+                'total': bank_total + cash_total
+            }
+
+    @staticmethod
+    def update_balance(account_type: str, account_id: int, amount: int) -> bool:
+        try:
+            with get_db() as conn:
+                c = conn.cursor()
+                if account_type == 'bank':
+                    c.execute(
+                        "UPDATE banks SET balance = balance + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                        [amount, account_id]
+                    )
+                elif account_type == 'cash':
+                    c.execute(
+                        "UPDATE cash_boxes SET balance = balance + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                        [amount, account_id]
+                    )
+                return True
+        except Exception as e:
+            logger.error(f"خطا در بروزرسانی مانده: {e}")
+            return False
+
+    @staticmethod
+    def generate_transaction_no() -> str:
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute("SELECT MAX(id) FROM finance_transactions")
+            max_id = c.fetchone()[0] or 0
+            return f"TRX{max_id + 1:06d}"
+
+
+# ============================================================
+# ========== PartyHelper ==========
+# ============================================================
+
+class PartyHelper:
+    """کلاس کمکی برای اشخاص"""
+
+    @staticmethod
+    def get_party_balance(party_id: int) -> int:
+        """محاسبه مانده واقعی شخص"""
+        try:
+            with get_db() as conn:
+                c = conn.cursor()
+                balance = 0
+                
+                c.execute("SELECT type FROM parties WHERE id = ?", [party_id])
+                row = c.fetchone()
+                if not row:
+                    return 0
+                
+                party_type = row['type'] if hasattr(row, 'keys') else row[0]
+                
+                # فاکتورها
+                if party_type == 'customer':
+                    c.execute("""
+                        SELECT COALESCE(SUM(net_amount), 0) FROM documents
+                        WHERE party_id = ? AND doc_type = 'sales'
+                    """, [party_id])
+                    balance += c.fetchone()[0] or 0
+                    
+                    c.execute("""
+                        SELECT COALESCE(SUM(net_amount), 0) FROM documents
+                        WHERE party_id = ? AND doc_type = 'sales_return'
+                    """, [party_id])
+                    balance -= c.fetchone()[0] or 0
+                else:
+                    c.execute("""
+                        SELECT COALESCE(SUM(net_amount), 0) FROM documents
+                        WHERE party_id = ? AND doc_type = 'purchase'
+                    """, [party_id])
+                    balance += c.fetchone()[0] or 0
+                    
+                    c.execute("""
+                        SELECT COALESCE(SUM(net_amount), 0) FROM documents
+                        WHERE party_id = ? AND doc_type = 'purchase_return'
+                    """, [party_id])
+                    balance -= c.fetchone()[0] or 0
+                
+                # تراکنش‌های مالی
+                if party_type == 'customer':
+                    c.execute("""
+                        SELECT COALESCE(SUM(amount), 0) FROM finance_transactions
+                        WHERE party_id = ? AND type IN ('receipt', 'income')
+                    """, [party_id])
+                    balance -= c.fetchone()[0] or 0
+                else:
+                    c.execute("""
+                        SELECT COALESCE(SUM(amount), 0) FROM finance_transactions
+                        WHERE party_id = ? AND type IN ('payment', 'expense')
+                    """, [party_id])
+                    balance -= c.fetchone()[0] or 0
+                
+                # چک‌ها
+                if party_type == 'customer':
+                    c.execute("""
+                        SELECT COALESCE(SUM(amount), 0) FROM checks
+                        WHERE party_id = ? AND type = 'received' AND status = 'collected'
+                    """, [party_id])
+                    balance -= c.fetchone()[0] or 0
+                else:
+                    c.execute("""
+                        SELECT COALESCE(SUM(amount), 0) FROM checks
+                        WHERE party_id = ? AND type = 'paid' AND status = 'collected'
+                    """, [party_id])
+                    balance -= c.fetchone()[0] or 0
+                
+                return int(balance)
+        except Exception as e:
+            logger.error(f"خطا در محاسبه مانده: {e}")
+            return 0
+
+    @staticmethod
+    def get_party_transactions(party_id: int, 
+                                from_date: str = None, 
+                                to_date: str = None,
+                                limit: int = 500) -> List[Dict]:
+        """دریافت تراکنش‌های شخص"""
+        try:
+            transactions = []
+            
+            with get_db() as conn:
+                c = conn.cursor()
+                
+                # فاکتورها
+                query = """
+                    SELECT d.date, d.doc_type as type, d.doc_no as ref,
+                           d.net_amount as amount, d.description
+                    FROM documents d
+                    WHERE d.party_id = ?
+                """
+                params = [party_id]
+                if from_date:
+                    query += " AND d.date >= ?"
+                    params.append(from_date)
+                if to_date:
+                    query += " AND d.date <= ?"
+                    params.append(to_date)
+                query += " ORDER BY d.date DESC LIMIT ?"
+                params.append(limit)
+                
+                c.execute(query, params)
+                type_map = {
+                    'sales': 'فروش', 'purchase': 'خرید',
+                    'sales_return': 'برگشت فروش', 'purchase_return': 'برگشت خرید',
+                }
+                for row in c.fetchall():
+                    r = dict(row)
+                    transactions.append({
+                        'date': r['date'],
+                        'type': type_map.get(r['type'], r['type']),
+                        'ref': r['ref'],
+                        'amount': r['amount'],
+                        'description': r['description'] or '',
+                        'kind': 'document',
+                    })
+                
+                # تراکنش‌های مالی
+                query = """
+                    SELECT t.date, t.type, t.transaction_no as ref,
+                           t.amount, t.description
+                    FROM finance_transactions t
+                    WHERE t.party_id = ?
+                """
+                params = [party_id]
+                if from_date:
+                    query += " AND t.date >= ?"
+                    params.append(from_date)
+                if to_date:
+                    query += " AND t.date <= ?"
+                    params.append(to_date)
+                query += " ORDER BY t.date DESC LIMIT ?"
+                params.append(limit)
+                
+                c.execute(query, params)
+                fin_type_map = {
+                    'receipt': 'دریافت', 'payment': 'پرداخت',
+                    'transfer': 'انتقال', 'income': 'درآمد',
+                    'expense': 'هزینه', 'capital': 'سرمایه',
+                }
+                for row in c.fetchall():
+                    r = dict(row)
+                    transactions.append({
+                        'date': r['date'],
+                        'type': fin_type_map.get(r['type'], r['type']),
+                        'ref': r['ref'],
+                        'amount': r['amount'],
+                        'description': r['description'] or '',
+                        'kind': 'transaction',
+                    })
+                
+                # چک‌ها
+                query = """
+                    SELECT ch.issue_date as date, ch.check_number as ref,
+                           ch.amount, ch.type, ch.status, ch.bank_name
+                    FROM checks ch
+                    WHERE ch.party_id = ?
+                """
+                params = [party_id]
+                if from_date:
+                    query += " AND ch.issue_date >= ?"
+                    params.append(from_date)
+                if to_date:
+                    query += " AND ch.issue_date <= ?"
+                    params.append(to_date)
+                query += " ORDER BY ch.issue_date DESC LIMIT ?"
+                params.append(limit)
+                
+                c.execute(query, params)
+                for row in c.fetchall():
+                    r = dict(row)
+                    transactions.append({
+                        'date': r['date'],
+                        'type': 'چک دریافتی' if r['type'] == 'received' else 'چک پرداختی',
+                        'ref': r['ref'],
+                        'amount': r['amount'],
+                        'description': f"{r['bank_name'] or ''} - {r['status']}",
+                        'kind': 'check',
+                    })
+            
+            transactions.sort(key=lambda x: x.get('date', ''), reverse=True)
+            return transactions[:limit]
+        
+        except Exception as e:
+            logger.error(f"خطا در دریافت تراکنش‌ها: {e}")
+            return []
+
+    @staticmethod
+    def generate_next_code(party_type: str = 'customer') -> str:
+        """تولید کد بعدی"""
+        prefix = "CUST" if party_type == 'customer' else "SUPP"
+        try:
+            with get_db() as conn:
+                c = conn.cursor()
+                c.execute(f"""
+                    SELECT code FROM parties 
+                    WHERE code LIKE '{prefix}%' 
+                    ORDER BY code DESC LIMIT 1
+                """)
+                last = c.fetchone()
+                
+                if last:
+                    code = last['code'] if hasattr(last, 'keys') else last[0]
+                    try:
+                        num = int(code.replace(prefix, '')) + 1
+                    except:
+                        num = 1
+                else:
+                    num = 1
+                
+                return f"{prefix}{num:05d}"
+        except Exception:
+            return f"{prefix}00001"
+
+    @staticmethod
+    def get_groups(party_type: str = None) -> List[Dict]:
+        """دریافت گروه‌های اشخاص"""
+        with get_db() as conn:
+            c = conn.cursor()
+            if party_type:
+                c.execute("""
+                    SELECT * FROM party_groups
+                    WHERE (party_type = ? OR party_type = 'both') AND is_active = 1
+                    ORDER BY name
+                """, [party_type])
             else:
+                c.execute("SELECT * FROM party_groups WHERE is_active = 1 ORDER BY name")
+            return [dict(row) for row in c.fetchall()]
+
+    @staticmethod
+    def add_note(party_id: int, note_text: str, note_type: str = 'general', created_by: str = None):
+        """افزودن یادداشت"""
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute("""
+                INSERT INTO party_notes (party_id, note_text, note_type, created_by)
+                VALUES (?, ?, ?, ?)
+            """, [party_id, note_text, note_type, created_by])
+
+    @staticmethod
+    def get_notes(party_id: int) -> List[Dict]:
+        """دریافت یادداشت‌ها"""
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute("""
+                SELECT * FROM party_notes WHERE party_id = ?
+                ORDER BY created_at DESC
+            """, [party_id])
+            return [dict(row) for row in c.fetchall()]
+
+    @staticmethod
+    def add_contact(party_id: int, name: str, position: str = None,
+                    phone: str = None, mobile: str = None, email: str = None):
+        """افزودن مخاطب"""
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute("""
+                INSERT INTO party_contacts 
+                (party_id, name, position, phone, mobile, email)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, [party_id, name, position, phone, mobile, email])
+
+    @staticmethod
+    def get_contacts(party_id: int) -> List[Dict]:
+        """دریافت مخاطبین"""
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute("""
+                SELECT * FROM party_contacts WHERE party_id = ?
+                ORDER BY is_primary DESC, name
+            """, [party_id])
+            return [dict(row) for row in c.fetchall()]
+
+    @staticmethod
+    def update_balance_cache(party_id: int):
+        """بروزرسانی مانده کش شده"""
+        try:
+            balance = PartyHelper.get_party_balance(party_id)
+            with get_db() as conn:
+                c = conn.cursor()
                 c.execute(
-                    "SELECT COALESCE(SUM(quantity), 0) FROM warehouse_stock WHERE product_id = ?",
-                    [product_id]
+                    "UPDATE parties SET balance = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    [balance, party_id]
                 )
-            row = c.fetchone()
-            return row[0] if row else 0
+        except Exception as e:
+            logger.error(f"خطا در بروزرسانی کش: {e}")
 
-    @staticmethod
-    def update_warehouse_stock(product_id: int, warehouse_id: int, quantity: float, operation: str = 'add'):
-        """
-        بروزرسانی موجودی انبار
 
-        Args:
-            product_id: شناسه محصول
-            warehouse_id: شناسه انبار
-            quantity: مقدار (همیشه مثبت)
-            operation: 'set' | 'add' | 'subtract'
-        """
-        with get_db() as conn:
-            c = conn.cursor()
-            if operation == 'set':
-                c.execute('''
-                    INSERT INTO warehouse_stock (product_id, warehouse_id, quantity, updated_at)
-                    VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-                    ON CONFLICT(product_id, warehouse_id) DO UPDATE SET
-                        quantity = ?,
-                        updated_at = CURRENT_TIMESTAMP
-                ''', [product_id, warehouse_id, quantity, quantity])
-            elif operation == 'add':
-                c.execute('''
-                    INSERT INTO warehouse_stock (product_id, warehouse_id, quantity, updated_at)
-                    VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-                    ON CONFLICT(product_id, warehouse_id) DO UPDATE SET
-                        quantity = quantity + ?,
-                        updated_at = CURRENT_TIMESTAMP
-                ''', [product_id, warehouse_id, quantity, quantity])
-            elif operation == 'subtract':
-                # ✅ رفع باگ: quantity مثبت، ولی تو VALUES مقدار اولیه 0 و بعد subtract
-                c.execute('''
-                    INSERT INTO warehouse_stock (product_id, warehouse_id, quantity, updated_at)
-                    VALUES (?, ?, 0, CURRENT_TIMESTAMP)
-                    ON CONFLICT(product_id, warehouse_id) DO UPDATE SET
-                        quantity = MAX(0, quantity - ?),
-                        updated_at = CURRENT_TIMESTAMP
-                ''', [product_id, warehouse_id, quantity])
-
-    @staticmethod
-    def get_total_stock(product_id: int) -> float:
-        """مجموع موجودی محصول در همه انبارها"""
-        with get_db() as conn:
-            c = conn.cursor()
-            c.execute(
-                "SELECT COALESCE(SUM(quantity), 0) FROM warehouse_stock WHERE product_id = ?",
-                [product_id]
-            )
-            row = c.fetchone()
-            return float(row[0]) if row and row[0] else 0
-
+# ============================================================
+# ========== ModuleLimitHelper ==========
+# ============================================================
 
 class ModuleLimitHelper:
     """مدیریت محدودیت ماژول‌ها"""
@@ -1122,7 +1193,7 @@ class ModuleLimitHelper:
             cls._cache_loaded = True
             return cls._limits_cache
         except Exception as e:
-            print(f"⚠️ خطا در خواندن محدودیت‌ها: {e}")
+            logger.warning(f"خطا در خواندن محدودیت‌ها: {e}")
             cls._limits_cache = {}
             cls._cache_loaded = True
             return {}
@@ -1146,6 +1217,7 @@ class ModuleLimitHelper:
                 'inventory': 'products',
                 'payroll': 'employees',
                 'parties': 'parties',
+                'finance': 'finance_transactions',
             }
             if module_name in table_map:
                 c.execute(f"SELECT COUNT(*) FROM {table_map[module_name]}")
@@ -1171,14 +1243,10 @@ class ModuleLimitHelper:
         else:
             return True, current, limit, f"{current} از {limit}"
 
-    @classmethod
-    def get_remaining(cls, customer_name: str, module_name: str) -> int:
-        limit = cls.get_module_limit(customer_name, module_name)
-        if limit == 0:
-            return -1
-        current = cls.get_current_count(module_name)
-        return max(0, limit - current)
 
+# ============================================================
+# ========== PayrollHelper ==========
+# ============================================================
 
 class PayrollHelper:
     """کلاس کمکی برای محاسبات حقوق"""
@@ -1247,23 +1315,9 @@ class PayrollHelper:
         return int(taxable * tax_rate)
 
 
-class PartyHelper:
-    """کلاس کمکی برای اشخاص"""
-
-    @staticmethod
-    def get_party_balance(party_id: int) -> int:
-        with get_db() as conn:
-            c = conn.cursor()
-            c.execute('''
-                SELECT
-                    COALESCE(SUM(CASE WHEN type='debit' THEN amount ELSE 0 END), 0) as total_debit,
-                    COALESCE(SUM(CASE WHEN type='credit' THEN amount ELSE 0 END), 0) as total_credit
-                FROM party_transactions
-                WHERE party_id = ?
-            ''', [party_id])
-            row = c.fetchone()
-            return (row['total_debit'] or 0) - (row['total_credit'] or 0)
-
+# ============================================================
+# ========== DocumentHelper ==========
+# ============================================================
 
 class DocumentHelper:
     """کلاس کمکی برای اسناد"""
@@ -1272,77 +1326,29 @@ class DocumentHelper:
     def get_next_doc_no(doc_type: str) -> str:
         with get_db() as conn:
             c = conn.cursor()
-            prefix = "SAL" if doc_type == 'sales' else "PUR"
-            c.execute(
-                f"SELECT MAX(CAST(SUBSTR(doc_no, 4) AS INTEGER)) FROM documents WHERE doc_no LIKE '{prefix}%'"
-            )
+            
+            prefix_map = {
+                'sales': 'SAL',
+                'purchase': 'PUR',
+                'sales_return': 'RSL',
+                'purchase_return': 'RPR',
+            }
+            prefix = prefix_map.get(doc_type, 'DOC')
+            
+            c.execute(f"""
+                SELECT MAX(CAST(SUBSTR(doc_no, 4) AS INTEGER)) 
+                FROM documents WHERE doc_no LIKE '{prefix}%'
+            """)
             max_no = c.fetchone()[0]
             return f"{prefix}{(max_no or 0) + 1:06d}"
 
-    @staticmethod
-    def _save_document(doc_type: str, party_id: int, date: str, items: List[Dict],
-                       discount: int, tax_rate: float, description: str = "") -> str:
-        """ذخیره سند با استفاده از RETURNING (سازگار با SQLite 3.35+)"""
-        with get_db(timeout=30.0) as conn:
-            c = conn.cursor()
-
-            doc_no = DocumentHelper.get_next_doc_no(doc_type)
-            total_amount = sum(item['total_price'] for item in items)
-            tax = int(total_amount * tax_rate / 100)
-            net_amount = total_amount - discount + tax
-            db_date = DateConverter.for_db(date)
-
-            c.execute('''
-                INSERT INTO documents
-                (doc_no, doc_type, date, party_id, total_amount, discount, tax, net_amount, description)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                RETURNING id
-            ''', (doc_no, doc_type, db_date, party_id, total_amount, discount, tax, net_amount, description))
-
-            row = c.fetchone()
-            doc_id = row['id'] if row else None
-
-            if not doc_id:
-                raise RuntimeError("خطا در دریافت شناسه سند")
-
-            for item in items:
-                c.execute('''
-                    INSERT INTO document_items
-                    (document_id, product_id, quantity, unit_price, total_price)
-                    VALUES (?, ?, ?, ?, ?)
-                ''', (doc_id, item['product_id'], item['quantity'], item['unit_price'], item['total_price']))
-
-                if doc_type == 'sales':
-                    c.execute(
-                        'UPDATE products SET stock = stock - ? WHERE id = ?',
-                        (item['quantity'], item['product_id'])
-                    )
-                else:
-                    c.execute(
-                        'UPDATE products SET stock = stock + ? WHERE id = ?',
-                        (item['quantity'], item['product_id'])
-                    )
-
-            print(f"✅ سند {doc_no} ثبت شد")
-            return doc_no
-
-    @staticmethod
-    def create_document(doc_type: str, party_id: int, date: str, items: List[Dict],
-                        discount: int, tax_rate: float, description: str = "") -> str:
-        return execute_with_retry(
-            DocumentHelper._save_document,
-            doc_type, party_id, date, items, discount, tax_rate, description,
-            max_retries=5,
-            delay=0.5
-        )
-
 
 # ============================================================
-# ========== توابع کمکی ==========
+# ========== توابع کمکی عمومی ==========
 # ============================================================
 
 def execute_with_retry(func, *args, max_retries: int = 3, delay: float = 0.5, **kwargs):
-    """اجرای تابع با تلاش مجدد در صورت قفل دیتابیس"""
+    """اجرای تابع با تلاش مجدد"""
     for attempt in range(max_retries):
         try:
             return func(*args, **kwargs)
@@ -1378,11 +1384,18 @@ def refresh_date_cache():
 # ============================================================
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    
     print(f"📦 نسخه SQLite: {sqlite3.sqlite_version}")
     DatabaseManager.init_db()
+    
     print("\n" + "=" * 60)
-    print("✅ دیتابیس ImanAccount v6.1 ساخته شد!")
+    print(f"✅ دیتابیس ImanAccount v{SCHEMA_VERSION} ساخته شد!")
     print("=" * 60)
     print(f"📁 مسیر: {DB_NAME}")
     print(f"📅 سیستم تاریخ: {DateConverter.get_date_system()}")
+    print("\n✅ معماری جدید:")
+    print("   • database.py فقط جداول هسته را می‌سازد")
+    print("   • جداول ماژولار در migrations/ تعریف شده‌اند")
+    print("   • MigrationRegistry همه را به ترتیب اجرا می‌کند")
     print("=" * 60)

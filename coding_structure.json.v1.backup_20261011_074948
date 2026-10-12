@@ -1,0 +1,20 @@
+{
+  "levels": [
+    {
+      "length": 2,
+      "color": "#3498db",
+      "name": "کل"
+    },
+    {
+      "length": 3,
+      "color": "#2ecc71",
+      "name": "معین"
+    },
+    {
+      "length": 3,
+      "color": "#e74c3c",
+      "name": "تفصیلی"
+    }
+  ],
+  "separator": "-"
+}

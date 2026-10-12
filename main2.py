@@ -1,6 +1,12 @@
 # main2.py
 # ============================================================
-# ImanAccount - نقطه ورود (v10.0 - First-Run Wizard)
+# ImanAccount - نقطه ورود (v11.0 - Fixed Menu + Wizard)
+# ============================================================
+# تغییرات v11.0:
+# ✅ رفع مشکل منوی خالی (register_default_menu قبل از Sidebar)
+# ✅ لاگ دیباگ کامل برای MenuRegistry
+# ✅ ساختار تمیزتر و قابل نگهداری
+# ✅ مدیریت خطای بهتر
 # ============================================================
 # ترتیب اجرا:
 #   1. Logging
@@ -11,7 +17,8 @@
 #   6. First-Run Check → Wizard (اگه لازمه)
 #   7. License Check
 #   8. Database Init
-#   9. MainWindow
+#   9. MenuRegistry Init ← مهم!
+#   10. MainWindow
 # ============================================================
 
 import sys
@@ -19,7 +26,10 @@ import os
 import importlib
 from pathlib import Path
 
-# ✅ sys.path
+# ============================================================
+# sys.path
+# ============================================================
+
 _PROJECT_ROOT = Path(__file__).parent.resolve()
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
@@ -29,7 +39,7 @@ print(f"✅ PROJECT_ROOT: {_PROJECT_ROOT}")
 
 
 # ============================================================
-# ✅ Logging — همیشه اول از همه!
+# Logging — همیشه اول از همه
 # ============================================================
 
 from logging_config import (
@@ -46,7 +56,7 @@ install_exception_hook()
 
 import logging
 logger = logging.getLogger(__name__)
-logger.info(f"🚀 شروع ImanAccount")
+logger.info(f"🚀 شروع ImanAccount v11.0")
 logger.info(f"📁 لاگ: {LOG_FILE}")
 
 
@@ -75,7 +85,7 @@ error_handler = get_error_handler()
 # ============================================================
 
 APP_NAME = "ImanAccount"
-APP_VERSION = "1.0.0"
+APP_VERSION = "11.0.0"
 
 
 # ============================================================
@@ -104,7 +114,7 @@ LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # ============================================================
-# Trial
+# Trial Management
 # ============================================================
 
 def _is_trial_used() -> bool:
@@ -116,9 +126,7 @@ def _is_trial_used() -> bool:
                     winreg.HKEY_CURRENT_USER,
                     r"Software\ImanAccount", 0, winreg.KEY_READ
                 )
-            except FileNotFoundError:
-                return False
-            except OSError:
+            except (FileNotFoundError, OSError):
                 return False
             
             try:
@@ -158,6 +166,8 @@ def _mark_trial_used():
 # ============================================================
 
 class LicenseDialog(QDialog):
+    """دیالوگ فعال‌سازی لایسنس"""
+    
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("🔐 فعال‌سازی لایسنس")
@@ -182,11 +192,13 @@ class LicenseDialog(QDialog):
         layout.setSpacing(12)
         layout.setContentsMargins(25, 25, 25, 25)
         
+        # عنوان
         title = QLabel("🔐 ImanAccount")
         title.setStyleSheet("font-size: 20pt; font-weight: bold; color: #e94560; padding: 5px;")
         title.setAlignment(Qt.AlignCenter)
         layout.addWidget(title)
         
+        # توضیحات
         desc = QLabel("لطفاً کلید لایسنس خود را وارد کنید\nیا از نسخه آزمایشی ۳۰ روزه استفاده کنید.")
         desc.setStyleSheet("color: #aaa; font-size: 10pt;")
         desc.setWordWrap(True)
@@ -195,6 +207,7 @@ class LicenseDialog(QDialog):
         
         layout.addSpacing(10)
         
+        # HWID
         hwid_label = QLabel("🖥️ شناسه سیستم (HWID):")
         hwid_label.setStyleSheet("color: #888; font-size: 9pt; font-weight: bold;")
         layout.addWidget(hwid_label)
@@ -228,6 +241,7 @@ class LicenseDialog(QDialog):
         layout.addLayout(hwid_layout)
         layout.addSpacing(5)
         
+        # کد لایسنس
         license_label = QLabel("🔑 کد لایسنس:")
         license_label.setStyleSheet("color: #888; font-size: 9pt; font-weight: bold;")
         layout.addWidget(license_label)
@@ -250,6 +264,7 @@ class LicenseDialog(QDialog):
         
         layout.addSpacing(10)
         
+        # دکمه‌ها
         btn_layout = QHBoxLayout()
         btn_layout.setSpacing(10)
         
@@ -293,6 +308,7 @@ class LicenseDialog(QDialog):
         
         layout.addLayout(btn_layout)
         
+        # وضعیت
         self.status_label = QLabel("")
         self.status_label.setStyleSheet("color: #FF9800; font-size: 9pt; min-height: 25px;")
         self.status_label.setAlignment(Qt.AlignCenter)
@@ -391,6 +407,8 @@ class LicenseDialog(QDialog):
 # ============================================================
 
 class MainApplication:
+    """برنامه اصلی ImanAccount"""
+    
     def __init__(self):
         self.app = None
         self.window = None
@@ -398,20 +416,27 @@ class MainApplication:
         self.license_core = None
         self.core = None
         self.is_first_run = False
+        self.menu_registry = None
+    
+    # ============================================================
+    # Run — نقطه ورود اصلی
+    # ============================================================
     
     def run(self):
         try:
+            # تنظیمات High DPI
             QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
             QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
             logger.info("✅ High DPI فعال شد")
             
+            # ساخت QApplication
             logger.info("🔄 راه‌اندازی QApplication...")
             self.app = QApplication(sys.argv)
             self.app.setApplicationName(f"{APP_NAME} - نسخه {APP_VERSION}")
             
-            # ============================================================
+            # ═══════════════════════════════════════════════════
             # 1. AppCore
-            # ============================================================
+            # ═══════════════════════════════════════════════════
             logger.info("🚀 راه‌اندازی AppCore...")
             try:
                 from core import get_app_core
@@ -422,9 +447,9 @@ class MainApplication:
                 logger.error(f"⚠️ خطا در AppCore: {e}")
                 self.core = None
             
-            # ============================================================
+            # ═══════════════════════════════════════════════════
             # 2. LicenseCore
-            # ============================================================
+            # ═══════════════════════════════════════════════════
             try:
                 from license_core import get_license_core
                 self.license_core = get_license_core()
@@ -434,14 +459,15 @@ class MainApplication:
                 QMessageBox.critical(None, "خطا", f"خطا:\n\n{str(e)}")
                 return 1
             
-            # ============================================================
-            # 3. First-Run Check — قبل از license!
-            # ============================================================
+            # ═══════════════════════════════════════════════════
+            # 3. First-Run Check
+            # ═══════════════════════════════════════════════════
             self.is_first_run = self._check_first_run()
+            logger.info(f"🔍 اولین اجرا: {self.is_first_run}")
             
-            # ============================================================
+            # ═══════════════════════════════════════════════════
             # 4. License Check
-            # ============================================================
+            # ═══════════════════════════════════════════════════
             logger.info("🔐 بررسی لایسنس...")
             if not self.handle_license():
                 return 0
@@ -455,25 +481,33 @@ class MainApplication:
                 except Exception:
                     pass
             
-            # ============================================================
+            # ═══════════════════════════════════════════════════
             # 5. Database Init
-            # ============================================================
+            # ═══════════════════════════════════════════════════
             logger.info("📂 راه‌اندازی دیتابیس...")
             if not self.init_database():
                 return 1
             
-            # ============================================================
-            # 6. First-Run Wizard (بعد از دیتابیس!)
-            # ============================================================
+            # ═══════════════════════════════════════════════════
+            # 6. First-Run Wizard
+            # ═══════════════════════════════════════════════════
             if self.is_first_run:
                 logger.info("🚀 اولین اجرا — نمایش Wizard")
                 if not self._run_first_run_wizard():
                     logger.warning("⚠️ کاربر Wizard رو لغو کرد")
                     return 0
             
-            # ============================================================
-            # 7. MainWindow
-            # ============================================================
+            # ═══════════════════════════════════════════════════
+            # 7. ✅ MenuRegistry Init — مهم برای منو!
+            # ═══════════════════════════════════════════════════
+            logger.info("=" * 60)
+            logger.info("📋 راه‌اندازی MenuRegistry...")
+            logger.info("=" * 60)
+            self._init_menu_registry()
+            
+            # ═══════════════════════════════════════════════════
+            # 8. MainWindow
+            # ═══════════════════════════════════════════════════
             logger.info("🖥️ بارگذاری پنجره اصلی...")
             if not self.load_main_window():
                 return 1
@@ -486,6 +520,7 @@ class MainApplication:
             else:
                 return 1
             
+            # اجرا
             exit_code = self.app.exec_()
             
             if self.core:
@@ -504,17 +539,59 @@ class MainApplication:
             return 1
     
     # ============================================================
+    # MenuRegistry Init — گام جدید و مهم
+    # ============================================================
+    
+    def _init_menu_registry(self):
+        """راه‌اندازی و ثبت منوی پیش‌فرض"""
+        try:
+            from menu_registry import get_menu_registry, register_default_menu
+            
+            # دریافت registry
+            self.menu_registry = get_menu_registry()
+            
+            # آمار قبل
+            stats_before = self.menu_registry.get_stats()
+            logger.info(
+                f"📊 MenuRegistry (قبل): "
+                f"groups={stats_before['groups']}, "
+                f"items={stats_before['items']}"
+            )
+            
+            # اگه خالی بود، ثبت کن
+            if stats_before['groups'] == 0:
+                logger.info("📋 MenuRegistry خالی است — ثبت منوی پیش‌فرض...")
+                register_default_menu()
+                
+                # آمار بعد
+                stats_after = self.menu_registry.get_stats()
+                logger.info(
+                    f"✅ MenuRegistry (بعد): "
+                    f"groups={stats_after['groups']}, "
+                    f"items={stats_after['items']}"
+                )
+            else:
+                logger.info("📋 MenuRegistry از قبل پر است")
+            
+            # چاپ ساختار (برای دیباگ)
+            try:
+                self.menu_registry.print_structure()
+            except Exception:
+                pass
+            
+            logger.info("=" * 60)
+        
+        except ImportError as e:
+            logger.error(f"❌ menu_registry پیدا نشد: {e}")
+        except Exception as e:
+            logger.error(f"❌ خطا در MenuRegistry: {e}", exc_info=True)
+    
+    # ============================================================
     # First-Run Check
     # ============================================================
     
     def _check_first_run(self) -> bool:
-        """
-        بررسی آیا این اولین اجراست
-        
-        بررسی می‌کنه:
-        1. آیا دیتابیس وجود داره؟
-        2. آیا کاربری هست؟
-        """
+        """بررسی آیا این اولین اجراست"""
         try:
             # مسیر دیتابیس
             if os.name == 'nt':
@@ -580,9 +657,6 @@ class MainApplication:
             
             if result == QWizard.Accepted:
                 logger.info("✅ Wizard با موفقیت تکمیل شد")
-                
-                # ✅ بعد از wizard، اطلاعات کاربران reload میشن
-                # چون کاربر جدید ساخته شده
                 return True
             else:
                 logger.warning("⚠️ کاربر Wizard رو لغو کرد")
@@ -608,7 +682,9 @@ class MainApplication:
     # ============================================================
     
     def handle_license(self) -> bool:
+        """بررسی و مدیریت لایسنس"""
         try:
+            # تلاش برای خواندن از فایل
             if LICENSE_FILE.exists():
                 try:
                     with open(LICENSE_FILE, 'r', encoding='utf-8') as f:
@@ -618,7 +694,7 @@ class MainApplication:
                         result = self.license_core.verify_license(license_key)
                         
                         if result.get('valid'):
-                            logger.info("✅ لایسنس معتبر است")
+                            logger.info("✅ لایسنس معتبر است (از فایل)")
                             
                             self.license_info = result.get('data', {}).copy()
                             self.license_info['days_left'] = result.get('days_left', 0)
@@ -626,13 +702,16 @@ class MainApplication:
                             
                             return True
                         else:
+                            # فایل نامعتبر — حذف کن
+                            logger.warning("⚠️ لایسنس فایل نامعتبر است — حذف")
                             try:
                                 LICENSE_FILE.unlink()
                             except Exception:
                                 pass
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(f"⚠️ خطا در خواندن فایل لایسنس: {e}")
             
+            # نمایش دیالوگ لایسنس
             dialog = LicenseDialog()
             if dialog.exec_() != QDialog.Accepted:
                 return False
@@ -641,7 +720,7 @@ class MainApplication:
             return bool(self.license_info)
         
         except Exception as e:
-            logger.error(f"❌ خطا: {e}")
+            logger.error(f"❌ خطا در handle_license: {e}")
             return False
     
     # ============================================================
@@ -649,6 +728,7 @@ class MainApplication:
     # ============================================================
     
     def init_database(self) -> bool:
+        """راه‌اندازی دیتابیس"""
         try:
             from database import DatabaseManager, DB_NAME
             DatabaseManager.init_db()
@@ -689,7 +769,7 @@ class MainApplication:
             return True
         
         except Exception as e:
-            logger.error(f"❌ خطا: {e}")
+            logger.error(f"❌ خطا در init_database: {e}")
             QMessageBox.critical(None, "خطا", f"{str(e)}")
             return False
     
@@ -698,11 +778,13 @@ class MainApplication:
     # ============================================================
     
     def load_main_window(self) -> bool:
+        """بارگذاری پنجره اصلی"""
         try:
             from ui.main_window import MainWindow
             self.window = MainWindow(self.license_info)
             logger.info("✅ پنجره اصلی ساخته شد")
             
+            # آیکون
             icon_paths = [
                 Path("Icon.ico"),
                 Path(__file__).parent / "Icon.ico",
@@ -718,7 +800,7 @@ class MainApplication:
             return True
         
         except Exception as e:
-            logger.error(f"❌ خطا: {e}")
+            logger.error(f"❌ خطا در load_main_window: {e}")
             logger.error(traceback.format_exc())
             QMessageBox.critical(None, "خطا", f"{str(e)}")
             return False
@@ -729,6 +811,7 @@ class MainApplication:
 # ============================================================
 
 def exception_hook(exctype, value, tb):
+    """Hook برای خطاهای غیرمنتظره"""
     error_msg = ''.join(traceback.format_exception(exctype, value, tb))
     logger.critical(f"❌ خطا:\n{error_msg}")
     try:
@@ -753,4 +836,5 @@ if __name__ == "__main__":
         sys.exit(0)
     except Exception as e:
         logger.critical(f"❌ {e}")
+        logger.critical(traceback.format_exc())
         sys.exit(1)

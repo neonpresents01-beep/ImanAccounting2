@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+# check_imports.py - نسخه نهایی
+# ============================================================
+
+import sys
+import importlib
+
+PACKAGES = [
+    # ===== PyQt5 =====
+    'PyQt5',
+    'PyQt5.QtCore',
+    'PyQt5.QtGui',
+    'PyQt5.QtWidgets',
+    'PyQt5.QtPrintSupport',
+    'PyQt5.QtChart',
+    'PyQt5.QtSvg',
+    'PyQt5.QtXml',
+    'PyQt5.QtNetwork',
+    'PyQt5.sip',
+    
+    # ===== Date =====
+    'persiantools',
+    'persiantools.jdatetime',
+    'pytz',
+    
+    # ===== Security =====
+    'cryptography',
+    'bcrypt',
+    
+    # ===== PDF =====
+    'reportlab',
+    'arabic_reshaper',
+    'bidi',
+    'PIL',
+    'PIL.Image',
+    
+    # ===== Network =====
+    'requests',
+    
+    # ===== ماژول‌های داخلی =====
+    'license_core',
+    'registry_guard',
+    'database',
+    'security',
+    'core',
+    'ui',
+    'plugins',
+    'additional',
+    'migration',
+    'shamsi_date',
+    'dialog_utils',
+    'screen_utils',
+    'logging_config',
+    'error_handler',
+    'path_utils',
+]
+
+
+def main():
+    print("=" * 70)
+    print("🔍 بررسی import های ImanAccount")
+    print("=" * 70)
+    print()
+    
+    missing = []
+    
+    for pkg in PACKAGES:
+        try:
+            importlib.import_module(pkg)
+            print(f"  ✅ {pkg}")
+        except ImportError:
+            print(f"  ❌ {pkg}")
+            missing.append(pkg)
+        except Exception as e:
+            print(f"  ⚠️ {pkg} → {e}")
+    
+    print()
+    print("=" * 70)
+    
+    if not missing:
+        print("🎉 همه import ها موفق!")
+        print("✅ آماده برای build")
+        return 0
+    
+    print(f"⚠️ {len(missing)} ماژول پیدا نشد:")
+    for m in missing:
+        print(f"  ❌ {m}")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

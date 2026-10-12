@@ -1,7 +1,14 @@
 # ui/document_widget.py
 # ============================================================
-# ویجت یکپارچه خرید و فروش - نسخه 3.0 (Refactored)
-# با پشتیبانی کامل از warehouse_stock و Migration خودکار
+# ویجت یکپارچه خرید و فروش — نسخه 4.0
+# ============================================================
+# تغییرات v4.0:
+# ✅ برگشت از فروش
+# ✅ برگشت از خرید
+# ✅ Migration خودکار
+# ✅ اتصال به سند اصلی
+# ✅ محدودیت برگشت (چک تعداد برگشتی)
+# ✅ اسناد مرتبط در تب جدید
 # ============================================================
 
 from PyQt5.QtWidgets import *
@@ -19,153 +26,52 @@ from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
-# ========== پشتیبانی از PDF ==========
+# PDF
 try:
-    from reportlab.pdfgen import canvas
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.units import mm
     from reportlab.pdfbase import pdfmetrics
     from reportlab.pdfbase.ttfonts import TTFont
     from reportlab.lib import colors
-    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+    from reportlab.platypus import (
+        SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+    )
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.lib.enums import TA_RIGHT, TA_CENTER
-    from PIL import Image
     PDF_AVAILABLE = True
 except ImportError:
     PDF_AVAILABLE = False
-    logger.warning("ReportLab یا PIL نصب نیست. برای چاپ PDF: pip install reportlab pillow")
 
-# ========== پشتیبانی از فارسی ==========
+# فارسی
 try:
     import arabic_reshaper
     from bidi.algorithm import get_display
     PERSIAN_SUPPORT = True
 except ImportError:
     PERSIAN_SUPPORT = False
-    logger.warning("کتابخانه‌های فارسی نصب نیستند.")
 
 
-# ============================================================
-# ========== Migration ==========
-# ============================================================
-
-def _migrate_products_stock_to_warehouse() -> dict:
-    """
-    اطمینان از همگام‌سازی products.stock با warehouse_stock.
-    
-    این تابع باید یک بار هنگام راه‌اندازی برنامه اجرا بشه.
-    
-    Returns:
-        dict: {'migrated': N, 'fixed': M, 'errors': [...]}
-    """
-    result = {'migrated': 0, 'fixed': 0, 'errors': []}
-    
-    try:
-        with get_db() as conn:
-            c = conn.cursor()
-            
-            # 1. پیدا کردن انبار پیش‌فرض
-            default_warehouse_id = None
-            for query in [
-                "SELECT id FROM warehouses WHERE is_default = 1 AND is_active = 1 LIMIT 1",
-                "SELECT id FROM warehouses WHERE is_active = 1 ORDER BY id LIMIT 1",
-            ]:
-                c.execute(query)
-                row = c.fetchone()
-                if row:
-                    default_warehouse_id = row[0] if not hasattr(row, 'keys') else row['id']
-                    break
-            
-            if not default_warehouse_id:
-                result['errors'].append("هیچ انبار فعالی یافت نشد")
-                logger.warning("Migration: هیچ انبار فعالی وجود ندارد — رد شد")
-                return result
-            
-            # 2. کالاهایی که در warehouse_stock هیچ رکوردی ندارند ولی موجودی دارند
-            c.execute("""
-                SELECT p.id, p.code, p.name, p.stock
-                FROM products p
-                WHERE p.stock > 0
-                  AND NOT EXISTS (
-                      SELECT 1 FROM warehouse_stock ws 
-                      WHERE ws.product_id = p.id AND ws.warehouse_id = ?
-                  )
-            """, [default_warehouse_id])
-            
-            for r in c.fetchall():
-                product_id = r['id'] if hasattr(r, 'keys') else r[0]
-                product_code = r['code'] if hasattr(r, 'keys') else r[1]
-                product_stock = r['stock'] if hasattr(r, 'keys') else r[3]
-                
-                c.execute("""
-                    INSERT INTO warehouse_stock 
-                    (product_id, warehouse_id, quantity, updated_at)
-                    VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-                """, [product_id, default_warehouse_id, product_stock])
-                
-                result['migrated'] += 1
-                logger.info(f"Migration: {product_code} → {product_stock:,.2f} واحد منتقل شد")
-            
-            # 3. بررسی اختلاف بین products.stock و مجموع warehouse_stock
-            c.execute("""
-                SELECT p.id, p.code, p.stock,
-                       COALESCE(
-                           (SELECT SUM(quantity) FROM warehouse_stock WHERE product_id = p.id),
-                           0
-                       ) as ws_total
-                FROM products p
-                WHERE p.stock > 0
-            """)
-            
-            for r in c.fetchall():
-                product_id = r['id'] if hasattr(r, 'keys') else r[0]
-                product_code = r['code'] if hasattr(r, 'keys') else r[1]
-                product_stock = r['stock'] if hasattr(r, 'keys') else r[2]
-                ws_total = r['ws_total'] if hasattr(r, 'keys') else r[3]
-                
-                diff = product_stock - ws_total
-                if abs(diff) > 0.01:
-                    c.execute("""
-                        INSERT INTO warehouse_stock 
-                        (product_id, warehouse_id, quantity, updated_at)
-                        VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-                        ON CONFLICT(product_id, warehouse_id) DO UPDATE SET
-                            quantity = quantity + ?,
-                            updated_at = CURRENT_TIMESTAMP
-                    """, [product_id, default_warehouse_id, diff, diff])
-                    
-                    result['fixed'] += 1
-                    logger.info(f"Migration: {product_code}: اختلاف {diff:,.2f} اصلاح شد")
-            
-            conn.commit()
-            
-            if result['migrated'] or result['fixed']:
-                logger.info(f"✅ Migration: {result['migrated']} منتقل، {result['fixed']} اصلاح")
-            else:
-                logger.info("✅ Migration: همه چیز همگام است")
-            
-            return result
-    
-    except Exception as e:
-        logger.error(f"خطا در Migration: {e}", exc_info=True)
-        result['errors'].append(str(e))
-        return result
-
+# ═══════════════════════════════════════════════════════════
+# Migration
+# ═══════════════════════════════════════════════════════════
 
 def run_migration_if_needed():
-    """اجرای Migration فقط یک بار در طول اجرای برنامه."""
     if not hasattr(run_migration_if_needed, '_done'):
-        _migrate_products_stock_to_warehouse()
+        try:
+            from ui.migrations_add_return_types import run_migration
+            run_migration()
+        except ImportError:
+            logger.warning("⚠️ migrations_add_return_types یافت نشد")
+        except Exception as e:
+            logger.warning(f"⚠️ خطا در Migration: {e}")
         run_migration_if_needed._done = True
 
 
-# ============================================================
-# ========== توابع کمکی ==========
-# ============================================================
+# ═══════════════════════════════════════════════════════════
+# Helpers
+# ═══════════════════════════════════════════════════════════
 
 def row_to_dict(row):
-    """تبدیل sqlite3.Row به dict"""
     if row is None:
         return {}
     try:
@@ -174,134 +80,72 @@ def row_to_dict(row):
         return {}
 
 
-def get_default_warehouse_id(cursor) -> int:
-    """
-    دریافت شناسه انبار پیش‌فرض.
-    اگر انبار پیش‌فرض نبود، اولین انبار فعال را برمی‌گرداند.
-    """
+def reshape_persian_text(text):
+    """تبدیل متن فارسی برای PDF"""
+    if not text:
+        return ""
+    if not PERSIAN_SUPPORT:
+        return str(text)
     try:
-        cursor.execute(
-            "SELECT id FROM warehouses WHERE is_default = 1 AND is_active = 1 LIMIT 1"
-        )
-        row = cursor.fetchone()
-        if row:
-            return row['id'] if hasattr(row, 'keys') else row[0]
-        
-        cursor.execute(
-            "SELECT id FROM warehouses WHERE is_active = 1 ORDER BY id LIMIT 1"
-        )
-        row = cursor.fetchone()
-        if row:
-            return row['id'] if hasattr(row, 'keys') else row[0]
-    except Exception as e:
-        logger.error(f"خطا در دریافت انبار پیش‌فرض: {e}")
-    
-    return None
-
-
-def get_product_real_stock(product_id: int, warehouse_id: int = None) -> float:
-    """
-    دریافت موجودی واقعی کالا از warehouse_stock.
-    اگر warehouse_id داده نشود، مجموع همه انبارها را برمی‌گرداند.
-    """
-    try:
-        with get_db() as conn:
-            c = conn.cursor()
-            if warehouse_id:
-                c.execute(
-                    "SELECT COALESCE(quantity, 0) FROM warehouse_stock "
-                    "WHERE product_id = ? AND warehouse_id = ?",
-                    [product_id, warehouse_id]
-                )
+        import re
+        text_str = str(text)
+        parts = re.split(r'([0-9]+|[a-zA-Z]+)', text_str)
+        result = []
+        for part in parts:
+            if part.isdigit() or (part.isalpha() and part.isascii()):
+                result.append(part)
             else:
-                c.execute(
-                    "SELECT COALESCE(SUM(quantity), 0) FROM warehouse_stock "
-                    "WHERE product_id = ?",
-                    [product_id]
-                )
-            row = c.fetchone()
-            return float(row[0]) if row else 0.0
-    except Exception as e:
-        logger.error(f"خطا در دریافت موجودی: {e}")
-        return 0.0
+                try:
+                    if part.strip():
+                        result.append(arabic_reshaper.reshape(part))
+                    else:
+                        result.append(part)
+                except Exception:
+                    result.append(part)
+        return get_display(''.join(result))
+    except Exception:
+        return str(text)
 
 
-def update_inventory(cursor, product_id: int, quantity: float,
-                     doc_type: str, reverse: bool = False) -> bool:
-    """
-    به‌روزرسانی همزمان products.stock و warehouse_stock.
-    
-    Args:
-        cursor: نشانگر دیتابیس
-        product_id: شناسه کالا
-        quantity: مقدار (همیشه مثبت)
-        doc_type: 'sales' یا 'purchase'
-        reverse: اگر True باشد، عمل برعکس انجام می‌شود (برای حذف/ویرایش)
-    
-    Returns:
-        True اگر موفق، False در غیر این صورت
-    """
-    try:
-        warehouse_id = get_default_warehouse_id(cursor)
-        
-        # فروش: کاهش موجودی | خرید: افزایش موجودی
-        # reverse=True: عمل برعکس
-        if doc_type == 'sales':
-            is_increase = reverse
-        else:
-            is_increase = not reverse
-        
-        # ===== 1. products.stock =====
-        if is_increase:
-            cursor.execute(
-                "UPDATE products SET stock = stock + ?, "
-                "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                [quantity, product_id]
-            )
-        else:
-            cursor.execute(
-                "UPDATE products SET stock = stock - ?, "
-                "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                [quantity, product_id]
-            )
-        
-        # ===== 2. warehouse_stock =====
-        if warehouse_id:
-            if is_increase:
-                cursor.execute("""
-                    INSERT INTO warehouse_stock 
-                    (product_id, warehouse_id, quantity, updated_at)
-                    VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-                    ON CONFLICT(product_id, warehouse_id) DO UPDATE SET
-                        quantity = quantity + ?,
-                        updated_at = CURRENT_TIMESTAMP
-                """, [product_id, warehouse_id, quantity, quantity])
-            else:
-                cursor.execute("""
-                    UPDATE warehouse_stock 
-                    SET quantity = quantity - ?, 
-                        updated_at = CURRENT_TIMESTAMP
-                    WHERE product_id = ? AND warehouse_id = ?
-                """, [quantity, product_id, warehouse_id])
-                
-                # اگر رکورد وجود نداشت، بساز (با مقدار منفی برای ردیابی)
-                if cursor.rowcount == 0:
-                    cursor.execute("""
-                        INSERT INTO warehouse_stock 
-                        (product_id, warehouse_id, quantity, updated_at)
-                        VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-                    """, [product_id, warehouse_id, -quantity])
-        
-        return True
-    
-    except Exception as e:
-        logger.error(f"خطا در به‌روزرسانی موجودی: {e}", exc_info=True)
-        return False
+def get_doc_type_display(doc_type: str) -> str:
+    types = {
+        'sales': '📤 فروش',
+        'purchase': '📥 خرید',
+        'sales_return': '🔙 برگشت فروش',
+        'purchase_return': '🔙 برگشت خرید',
+    }
+    return types.get(doc_type, doc_type)
 
 
-# ============================================================
-# ========== ویجت اصلی ============
-# ============================================================
+def get_doc_type_prefix(doc_type: str) -> str:
+    prefixes = {
+        'sales': 'SAL',
+        'purchase': 'PUR',
+        'sales_return': 'RSL',
+        'purchase_return': 'RPR',
+    }
+    return prefixes.get(doc_type, 'DOC')
+
+
+def is_return_type(doc_type: str) -> bool:
+    return doc_type in ('sales_return', 'purchase_return')
+
+
+def get_original_type(return_type: str) -> str:
+    map_ = {
+        'sales_return': 'sales',
+        'purchase_return': 'purchase',
+    }
+    return map_.get(return_type, '')
+
+
+def is_sales_type(doc_type: str) -> bool:
+    return doc_type in ('sales', 'sales_return')
+
+
+# ═══════════════════════════════════════════════════════════
+# ویجت اصلی
+# ═══════════════════════════════════════════════════════════
 
 class DocumentWidget(BaseWidget):
     """ویجت یکپارچه خرید و فروش"""
@@ -310,6 +154,7 @@ class DocumentWidget(BaseWidget):
     
     def __init__(self, customer_name: str = "", user_level: str = 'viewer', parent=None):
         super().__init__(parent)
+        
         self.customer_name = customer_name
         self.user_level = user_level
         self.documents_data = []
@@ -318,9 +163,9 @@ class DocumentWidget(BaseWidget):
         self.current_doc_type = "sales"
         self.current_document = None
         self.current_items = []
+        
         self.screen_manager = ScreenManager()
         
-        # اجرای Migration یک بار
         run_migration_if_needed()
         
         self.tax_rate = self._get_tax_rate()
@@ -331,21 +176,14 @@ class DocumentWidget(BaseWidget):
         self.update_ui_by_permission()
         self.apply_theme()
     
-    # ============================================================
-    # تنظیمات
-    # ============================================================
-    
     def _get_tax_rate(self) -> float:
         try:
             with get_db() as conn:
                 c = conn.cursor()
                 c.execute("SELECT value FROM settings WHERE key = 'tax_rate'")
                 row = c.fetchone()
-                if row:
-                    return float(row[0]) / 100
-                return 0.09
-        except Exception as e:
-            logger.warning(f"خطا در دریافت نرخ مالیات: {e}")
+                return float(row[0]) / 100 if row else 0.09
+        except Exception:
             return 0.09
     
     def _get_company_info(self) -> dict:
@@ -353,24 +191,12 @@ class DocumentWidget(BaseWidget):
             with get_db() as conn:
                 c = conn.cursor()
                 c.execute("SELECT key, value FROM settings WHERE key LIKE 'company_%'")
-                info = {}
-                for row in c.fetchall():
-                    info[row['key']] = row['value']
-                
+                info = {row['key']: row['value'] for row in c.fetchall()}
                 if not info.get('company_name'):
                     info['company_name'] = 'شرکت حسابداری پارسه'
                 return info
-        except Exception as e:
-            logger.warning(f"خطا در دریافت اطلاعات شرکت: {e}")
-            return {
-                'company_name': 'شرکت حسابداری پارسه',
-                'company_phone': '021-12345678',
-                'company_address': 'تهران، خیابان اصلی، پلاک 123'
-            }
-    
-    # ============================================================
-    # مدیریت سطح دسترسی
-    # ============================================================
+        except Exception:
+            return {'company_name': 'شرکت حسابداری پارسه'}
     
     def set_user_level(self, level: str):
         self.user_level = level
@@ -378,39 +204,28 @@ class DocumentWidget(BaseWidget):
     
     def update_ui_by_permission(self):
         can_edit = self.user_level in ['admin', 'accountant', 'inventory']
-        can_view = self.user_level in ['admin', 'accountant', 'inventory', 'viewer']
         can_delete = self.user_level in ['admin', 'accountant']
         
-        if hasattr(self, 'new_btn'):
-            self.new_btn.setVisible(can_edit)
-        if hasattr(self, 'edit_btn'):
-            self.edit_btn.setVisible(can_edit)
+        for btn_name in ['new_btn', 'edit_btn', 'return_btn']:
+            if hasattr(self, btn_name):
+                getattr(self, btn_name).setVisible(can_edit)
+        
         if hasattr(self, 'delete_btn'):
             self.delete_btn.setVisible(can_delete)
-        if hasattr(self, 'print_btn'):
-            self.print_btn.setVisible(can_view)
-        if hasattr(self, 'pdf_btn'):
-            self.pdf_btn.setVisible(can_view)
-        
-        if hasattr(self, 'table'):
-            if not can_edit:
-                self.table.setEditTriggers(QTableWidget.NoEditTriggers)
-            else:
-                self.table.setEditTriggers(
-                    QTableWidget.DoubleClicked | QTableWidget.EditKeyPressed
-                )
     
-    # ============================================================
-    # رابط کاربری
-    # ============================================================
+    # ═══════════════════════════════════════════════════════
+    # UI
+    # ═══════════════════════════════════════════════════════
     
     def setup_ui(self):
         layout = QHBoxLayout(self)
         layout.setSpacing(self.spacing(10))
-        layout.setContentsMargins(self.margin(10), self.margin(10),
-                                  self.margin(10), self.margin(10))
+        layout.setContentsMargins(
+            self.margin(10), self.margin(10),
+            self.margin(10), self.margin(10)
+        )
         
-        # ========== پنل راست ==========
+        # ═══ پنل راست ═══
         right_panel = QWidget()
         right_panel.setObjectName("cardWidget")
         right_layout = QVBoxLayout(right_panel)
@@ -425,7 +240,6 @@ class DocumentWidget(BaseWidget):
         self.status_label.setStyleSheet("color: #888; font-size: 9pt; padding: 5px;")
         title_layout.addWidget(self.status_label)
         title_layout.addStretch()
-        
         right_layout.addLayout(title_layout)
         
         toolbar = self._create_toolbar()
@@ -437,10 +251,14 @@ class DocumentWidget(BaseWidget):
         type_layout.addWidget(QLabel("📂 نوع سند:"))
         
         self.doc_type_combo = QComboBox()
-        self.doc_type_combo.addItems(["📤 فاکتور فروش", "📥 فاکتور خرید"])
+        self.doc_type_combo.addItems([
+            "📤 فاکتور فروش",
+            "📥 فاکتور خرید",
+            "🔙 برگشت از فروش",
+            "🔙 برگشت از خرید",
+        ])
         self.doc_type_combo.currentIndexChanged.connect(self.on_type_changed)
         self.doc_type_combo.setMinimumHeight(self.scaled(32))
-        self.doc_type_combo.setStyleSheet("padding: 5px; border-radius: 5px;")
         type_layout.addWidget(self.doc_type_combo)
         
         type_layout.addStretch()
@@ -467,7 +285,6 @@ class DocumentWidget(BaseWidget):
         
         clear_filter_btn = self.create_button("✖️", "dangerBtn")
         clear_filter_btn.setMaximumWidth(self.scaled(30))
-        clear_filter_btn.setToolTip("پاک کردن فیلترها")
         clear_filter_btn.clicked.connect(self.clear_filters)
         filter_layout.addWidget(clear_filter_btn)
         
@@ -485,7 +302,6 @@ class DocumentWidget(BaseWidget):
         self.table.doubleClicked.connect(self.edit_document)
         right_layout.addWidget(self.table)
         
-        # آمار
         self.stats_label = QLabel("📊 مجموع: ۰ سند | ۰ ریال")
         self.stats_label.setStyleSheet("""
             font-weight: bold;
@@ -496,7 +312,7 @@ class DocumentWidget(BaseWidget):
         """)
         right_layout.addWidget(self.stats_label)
         
-        # ========== پنل چپ ==========
+        # ═══ پنل چپ ═══
         left_panel = QWidget()
         left_panel.setObjectName("cardWidget")
         left_panel.setMaximumWidth(self.scaled(500))
@@ -530,6 +346,11 @@ class DocumentWidget(BaseWidget):
         )
         self.detail_tabs.addTab(self.items_detail_table, "📦 اقلام")
         
+        self.related_text = QTextEdit()
+        self.related_text.setReadOnly(True)
+        self.related_text.setPlaceholderText("سند مرتبطی وجود ندارد")
+        self.detail_tabs.addTab(self.related_text, "🔗 اسناد مرتبط")
+        
         left_layout.addWidget(self.detail_tabs)
         
         btn_layout = QHBoxLayout()
@@ -558,7 +379,6 @@ class DocumentWidget(BaseWidget):
         layout.addWidget(right_panel, 2)
         layout.addWidget(left_panel, 1)
         
-        # تاریخ‌های فیلتر
         today = get_today_jalali()
         self.filter_from_date.set_date(today)
         self.filter_to_date.set_date(today)
@@ -577,6 +397,11 @@ class DocumentWidget(BaseWidget):
         self.edit_btn.clicked.connect(self.edit_document)
         toolbar.addWidget(self.edit_btn)
         
+        self.return_btn = self.create_button("🔙 برگشت", "infoBtn")
+        self.return_btn.setToolTip("ثبت برگشت از سند انتخاب‌شده")
+        self.return_btn.clicked.connect(self.create_return)
+        toolbar.addWidget(self.return_btn)
+        
         self.delete_btn = self.create_button("🗑️ حذف", "dangerBtn")
         self.delete_btn.clicked.connect(self.delete_document)
         toolbar.addWidget(self.delete_btn)
@@ -589,27 +414,27 @@ class DocumentWidget(BaseWidget):
         
         return toolbar
     
-    # ============================================================
-    # بارگذاری داده‌ها
-    # ============================================================
+    # ═══════════════════════════════════════════════════════
+    # Load Data
+    # ═══════════════════════════════════════════════════════
     
     def load_data(self):
-        doc_type = "sales" if self.current_doc_type == "sales" else "purchase"
-        
         try:
             with get_db() as conn:
                 c = conn.cursor()
+                
+                # اسناد
                 c.execute("""
                     SELECT d.*, p.name as party_name 
                     FROM documents d 
                     JOIN parties p ON d.party_id = p.id 
                     WHERE d.doc_type = ? 
                     ORDER BY d.id DESC
-                """, [doc_type])
+                """, [self.current_doc_type])
                 self.documents_data = [row_to_dict(row) for row in c.fetchall()]
                 
-                # کالاها با موجودی واقعی
-                price_col = 'sale_price' if self.current_doc_type == "sales" else 'purchase_price'
+                # کالاها
+                price_col = 'sale_price' if is_sales_type(self.current_doc_type) else 'purchase_price'
                 c.execute(f"""
                     SELECT p.id, p.code, p.name, p.{price_col} as price,
                            p.stock,
@@ -624,7 +449,7 @@ class DocumentWidget(BaseWidget):
                 self.products = [row_to_dict(row) for row in c.fetchall()]
                 
                 # اشخاص
-                party_type = "customer" if doc_type == "sales" else "supplier"
+                party_type = "customer" if is_sales_type(self.current_doc_type) else "supplier"
                 c.execute(
                     'SELECT id, code, name FROM parties WHERE type = ? ORDER BY name',
                     [party_type]
@@ -635,7 +460,7 @@ class DocumentWidget(BaseWidget):
             self.update_stats()
         
         except Exception as e:
-            logger.error(f"خطا در بارگذاری داده‌ها: {e}", exc_info=True)
+            logger.error(f"خطا در بارگذاری: {e}", exc_info=True)
             self.documents_data = []
             self.display_documents([])
     
@@ -674,14 +499,10 @@ class DocumentWidget(BaseWidget):
     def update_stats(self):
         total_count = len(self.documents_data)
         total_amount = sum(doc.get('net_amount', 0) or 0 for doc in self.documents_data)
-        doc_type_text = "فروش" if self.current_doc_type == "sales" else "خرید"
+        type_text = get_doc_type_display(self.current_doc_type)
         self.stats_label.setText(
-            f"📊 مجموع: {total_count} سند {doc_type_text} | {total_amount:,.0f} ریال"
+            f"📊 {type_text} | {total_count} سند | {total_amount:,.0f} ریال"
         )
-    
-    # ============================================================
-    # فیلتر
-    # ============================================================
     
     def filter_documents(self):
         search_text = self.search_input.text().strip().lower()
@@ -696,8 +517,8 @@ class DocumentWidget(BaseWidget):
         for doc in self.documents_data:
             match_search = True
             if search_text:
-                doc_no = doc.get('doc_no', '').lower()
-                party_name = doc.get('party_name', '').lower()
+                doc_no = str(doc.get('doc_no', '')).lower()
+                party_name = str(doc.get('party_name', '')).lower()
                 match_search = search_text in doc_no or search_text in party_name
             
             match_date = True
@@ -719,9 +540,9 @@ class DocumentWidget(BaseWidget):
         self.filter_to_date.set_date(today)
         self.display_documents(self.documents_data)
     
-    # ============================================================
-    # نمایش جزئیات
-    # ============================================================
+    # ═══════════════════════════════════════════════════════
+    # Selection
+    # ═══════════════════════════════════════════════════════
     
     def on_document_selected(self):
         row = self.table.currentRow()
@@ -747,50 +568,54 @@ class DocumentWidget(BaseWidget):
                 """, [doc.get('id')])
                 self.current_items = [row_to_dict(row) for row in c.fetchall()]
             
+            # HTML
             html = self._generate_detail_html(doc, self.current_items)
             self.details_text.setHtml(html)
             self.display_items_table(self.current_items)
             
+            # اسناد مرتبط
+            self._show_related_documents(doc.get('id'))
+            
             status_text = "✅ تأیید شده" if doc.get('is_approved', 0) else "⏳ در انتظار تأیید"
             self.detail_status.setText(f"📌 وضعیت: {status_text}")
-            if doc.get('is_approved', 0):
-                self.detail_status.setStyleSheet("color: #27ae60; font-size: 9pt; padding: 5px;")
-            else:
-                self.detail_status.setStyleSheet("color: #f39c12; font-size: 9pt; padding: 5px;")
         
         except Exception as e:
             logger.error(f"خطا در نمایش جزئیات: {e}", exc_info=True)
             self.details_text.setText(f"⚠️ خطا: {str(e)}")
     
     def _generate_detail_html(self, doc, items):
-        doc_type_text = "فروش" if doc.get('doc_type') == 'sales' else "خرید"
-        party_type_text = "مشتری" if doc.get('doc_type') == 'sales' else "تأمین‌کننده"
+        doc_type_text = get_doc_type_display(doc.get('doc_type', ''))
+        party_type_text = "مشتری" if is_sales_type(doc.get('doc_type', '')) else "تأمین‌کننده"
         
         html = f"""
         <div style='font-family: Tahoma; direction: rtl; font-size: 10pt;'>
-            <h3 style='text-align: center; color: #273c75;'>📄 فاکتور {doc_type_text}</h3>
+            <h3 style='text-align: center; color: #273c75;'>{doc_type_text}</h3>
             
             <table width='100%' style='margin: 10px 0;'>
                 <tr><td><b>شماره:</b></td><td>{doc.get('doc_no', '')}</td></tr>
-                <tr><td><b>تاریخ:</b></td><td>{safe_display_date(doc.get('date', '')) if doc.get('date') else ''}</td></tr>
+                <tr><td><b>تاریخ:</b></td><td>{safe_display_date(doc.get('date', ''))}</td></tr>
                 <tr><td><b>{party_type_text}:</b></td><td>{doc.get('party_name', '')}</td></tr>
             </table>
             
             <hr>
             
-            <h4>📦 اقلام فاکتور:</h4>
+            <h4>📦 اقلام:</h4>
             <table width='100%' border='1' style='border-collapse: collapse;'>
                 <tr style='background: #273c75; color: white;'>
-                    <th>کد</th><th>کالا</th><th>تعداد</th><th>قیمت واحد</th><th>جمع</th>
+                    <th>کد</th><th>کالا</th><th>تعداد</th><th>فی</th><th>جمع</th>
                 </tr>
         """
         
         for item in items:
+            returned = item.get('returned_qty', 0) or 0
+            qty = item.get('quantity', 0)
+            return_info = f" (برگشتی: {returned})" if returned > 0 else ""
+            
             html += f"""
                 <tr>
                     <td>{item.get('product_code', '')}</td>
                     <td>{item.get('product_name', '')}</td>
-                    <td style='text-align: center;'>{item.get('quantity', 0):,.2f}</td>
+                    <td style='text-align: center;'>{qty:,.2f}{return_info}</td>
                     <td style='text-align: left;'>{item.get('unit_price', 0):,.0f}</td>
                     <td style='text-align: left;'>{item.get('total_price', 0):,.0f}</td>
                 </tr>
@@ -801,12 +626,12 @@ class DocumentWidget(BaseWidget):
             </table>
             <hr>
             <table width='100%'>
-                <tr><td><b>جمع کل:</b></td><td style='text-align: left;'>{doc.get('total_amount', 0):,.0f} ریال</td></tr>
-                <tr><td><b>تخفیف:</b></td><td style='text-align: left;'>{doc.get('discount', 0):,.0f} ریال</td></tr>
-                <tr><td><b>مالیات ({tax_percent}%):</b></td><td style='text-align: left;'>{doc.get('tax', 0):,.0f} ریال</td></tr>
+                <tr><td><b>جمع کل:</b></td><td style='text-align: left;'>{doc.get('total_amount', 0):,.0f}</td></tr>
+                <tr><td><b>تخفیف:</b></td><td style='text-align: left;'>{doc.get('discount', 0):,.0f}</td></tr>
+                <tr><td><b>مالیات ({tax_percent}%):</b></td><td style='text-align: left;'>{doc.get('tax', 0):,.0f}</td></tr>
                 <tr style='font-weight: bold; font-size: 12pt;'>
-                    <td style='color: #27ae60;'>💵 مبلغ قابل پرداخت:</td>
-                    <td style='text-align: left; color: #27ae60;'>{doc.get('net_amount', 0):,.0f} ریال</td>
+                    <td style='color: #27ae60;'>💵 مبلغ نهایی:</td>
+                    <td style='text-align: left; color: #27ae60;'>{doc.get('net_amount', 0):,.0f}</td>
                 </tr>
             </table>
         </div>
@@ -820,7 +645,12 @@ class DocumentWidget(BaseWidget):
             self.items_detail_table.setItem(i, 0, QTableWidgetItem(item.get('product_code', '')))
             self.items_detail_table.setItem(i, 1, QTableWidgetItem(item.get('product_name', '')))
             
-            qty_item = QTableWidgetItem(f"{item.get('quantity', 0):,.2f}")
+            returned = item.get('returned_qty', 0) or 0
+            qty_text = f"{item.get('quantity', 0):,.2f}"
+            if returned > 0:
+                qty_text += f" (برگشتی: {returned:,.2f})"
+            
+            qty_item = QTableWidgetItem(qty_text)
             qty_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
             self.items_detail_table.setItem(i, 2, qty_item)
             
@@ -833,14 +663,73 @@ class DocumentWidget(BaseWidget):
             total_item.setForeground(QColor('#27ae60'))
             self.items_detail_table.setItem(i, 4, total_item)
     
-    # ============================================================
-    # عملیات اصلی
-    # ============================================================
+    def _show_related_documents(self, doc_id):
+        """نمایش اسناد مرتبط (برگشتی)"""
+        try:
+            with get_db() as conn:
+                c = conn.cursor()
+                
+                # اسناد برگشتی از این سند
+                c.execute("""
+                    SELECT d.doc_no, d.date, d.net_amount, dr.reason
+                    FROM document_returns dr
+                    JOIN documents d ON dr.return_doc_id = d.id
+                    WHERE dr.original_doc_id = ?
+                """, [doc_id])
+                returns_from = c.fetchall()
+                
+                # سند اصلی این برگشت
+                c.execute("""
+                    SELECT d.doc_no, d.date, d.net_amount, dr.reason
+                    FROM document_returns dr
+                    JOIN documents d ON dr.original_doc_id = d.id
+                    WHERE dr.return_doc_id = ?
+                """, [doc_id])
+                returns_to = c.fetchall()
+            
+            html = "<div style='font-family: Tahoma; direction: rtl; padding: 10px;'>"
+            
+            if returns_from:
+                html += "<h4>🔙 برگشت‌های این سند:</h4><ul>"
+                for r in returns_from:
+                    r_dict = row_to_dict(r)
+                    html += f"<li>سند {r_dict.get('doc_no', '')} - تاریخ {safe_display_date(r_dict.get('date', ''))} - مبلغ {r_dict.get('net_amount', 0):,.0f}</li>"
+                html += "</ul>"
+            
+            if returns_to:
+                html += "<h4>📄 سند اصلی:</h4><ul>"
+                for r in returns_to:
+                    r_dict = row_to_dict(r)
+                    html += f"<li>سند {r_dict.get('doc_no', '')} - تاریخ {safe_display_date(r_dict.get('date', ''))} - مبلغ {r_dict.get('net_amount', 0):,.0f}</li>"
+                html += "</ul>"
+            
+            if not returns_from and not returns_to:
+                html += "<p style='color: #888; text-align: center; padding: 20px;'>سند مرتبطی وجود ندارد</p>"
+            
+            html += "</div>"
+            self.related_text.setHtml(html)
+        
+        except Exception as e:
+            logger.warning(f"خطا در نمایش اسناد مرتبط: {e}")
+    
+    # ═══════════════════════════════════════════════════════
+    # Actions
+    # ═══════════════════════════════════════════════════════
     
     def on_type_changed(self):
-        self.current_doc_type = "sales" if self.doc_type_combo.currentIndex() == 0 else "purchase"
+        idx = self.doc_type_combo.currentIndex()
+        types = ['sales', 'purchase', 'sales_return', 'purchase_return']
+        self.current_doc_type = types[idx]
         self.load_data()
         self.clear_details()
+    
+    def clear_details(self):
+        self.details_text.clear()
+        self.items_detail_table.setRowCount(0)
+        self.related_text.clear()
+        self.detail_status.setText("")
+        self.current_document = None
+        self.current_items = []
     
     def new_document(self):
         if not self.check_document_limit():
@@ -848,14 +737,12 @@ class DocumentWidget(BaseWidget):
         
         if not self.products:
             QMessageBox.warning(self, "خطا",
-                "⚠️ هیچ کالایی در سیستم تعریف نشده است!\n"
-                "لطفاً ابتدا از بخش انبار کالا تعریف کنید.")
+                "⚠️ هیچ کالایی در سیستم تعریف نشده است!")
             return
         
         if not self.parties:
             QMessageBox.warning(self, "خطا",
-                "⚠️ هیچ طرف حسابی در سیستم تعریف نشده است!\n"
-                "لطفاً ابتدا از بخش اشخاص تعریف کنید.")
+                "⚠️ هیچ طرف حسابی تعریف نشده است!")
             return
         
         dialog = DocumentDialog(
@@ -870,17 +757,17 @@ class DocumentWidget(BaseWidget):
         if dialog.exec_():
             self.load_data()
             self.document_changed.emit()
-            QMessageBox.information(self, "موفق", "✅ سند با موفقیت ثبت شد!")
+            QMessageBox.information(self, "موفق", "✅ سند ثبت شد!")
     
     def edit_document(self):
         row = self.table.currentRow()
         if row < 0:
-            QMessageBox.warning(self, "خطا", "لطفاً یک سند را انتخاب کنید!")
+            QMessageBox.warning(self, "خطا", "یک سند انتخاب کنید!")
             return
         
         if self.user_level not in ['admin', 'accountant']:
             QMessageBox.warning(self, "دسترسی محدود",
-                "⚠️ فقط مدیر سیستم و حسابدار می‌توانند اسناد را ویرایش کنند!")
+                "⚠️ فقط مدیر و حسابدار می‌توانند ویرایش کنند!")
             return
         
         doc_no = self.table.item(row, 0).text()
@@ -891,7 +778,12 @@ class DocumentWidget(BaseWidget):
                 break
         
         if not doc:
-            QMessageBox.warning(self, "خطا", "سند پیدا نشد!")
+            return
+        
+        if is_return_type(doc.get('doc_type', '')):
+            QMessageBox.warning(self, "خطا",
+                "⚠️ اسناد برگشتی قابل ویرایش نیستند!\n"
+                "برای اصلاح، سند برگشتی را حذف و مجدد ثبت کنید.")
             return
         
         dialog = DocumentDialog(
@@ -907,26 +799,79 @@ class DocumentWidget(BaseWidget):
         if dialog.exec_():
             self.load_data()
             self.document_changed.emit()
-            QMessageBox.information(self, "موفق", "✅ سند با موفقیت ویرایش شد!")
+            QMessageBox.information(self, "موفق", "✅ سند ویرایش شد!")
     
-    def delete_document(self):
+    # ═══════════════════════════════════════════════════════
+    # 🔙 برگشت — قابلیت جدید
+    # ═══════════════════════════════════════════════════════
+    
+    def create_return(self):
+        """ثبت برگشت از سند انتخاب‌شده"""
         row = self.table.currentRow()
         if row < 0:
-            QMessageBox.warning(self, "خطا", "لطفاً یک سند را انتخاب کنید!")
+            QMessageBox.warning(self, "خطا", "یک سند انتخاب کنید!")
             return
         
         if self.user_level not in ['admin', 'accountant']:
             QMessageBox.warning(self, "دسترسی محدود",
-                "⚠️ فقط مدیر سیستم و حسابدار می‌توانند اسناد را حذف کنند!")
+                "⚠️ فقط مدیر و حسابدار می‌توانند برگشت ثبت کنند!")
+            return
+        
+        doc = self.documents_data[row]
+        
+        # چک نوع سند
+        if is_return_type(doc.get('doc_type', '')):
+            QMessageBox.warning(self, "خطا",
+                "⚠️ اسناد برگشتی، برگشت‌پذیر نیستند!")
+            return
+        
+        # باز کردن دیالوگ برگشت
+        dialog = ReturnDialog(
+            document=doc,
+            parent=self
+        )
+        
+        if dialog.exec_():
+            self.load_data()
+            self.document_changed.emit()
+            QMessageBox.information(self, "موفق", 
+                "✅ سند برگشتی ثبت شد و موجودی/حساب‌ها اصلاح شدند!")
+    
+    def delete_document(self):
+        row = self.table.currentRow()
+        if row < 0:
+            QMessageBox.warning(self, "خطا", "یک سند انتخاب کنید!")
+            return
+        
+        if self.user_level not in ['admin', 'accountant']:
+            QMessageBox.warning(self, "دسترسی محدود",
+                "⚠️ فقط مدیر و حسابدار!")
             return
         
         doc_no = self.table.item(row, 0).text()
         doc_type = self.current_doc_type
         
+        # چک اسناد برگشتی
+        doc_id = self.documents_data[row].get('id')
+        
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute("""
+                SELECT COUNT(*) FROM document_returns
+                WHERE original_doc_id = ? OR return_doc_id = ?
+            """, [doc_id, doc_id])
+            return_count = c.fetchone()[0] or 0
+        
+        if return_count > 0:
+            QMessageBox.warning(self, "خطا",
+                f"⚠️ این سند {return_count} سند برگشتی مرتبط دارد!\n"
+                f"ابتدا اسناد برگشتی را حذف کنید.")
+            return
+        
         reply = QMessageBox.question(
             self, "تأیید حذف",
             f"آیا از حذف سند {doc_no} اطمینان دارید؟\n"
-            f"این عمل غیرقابل بازگشت است!",
+            f"این عمل قابل بازگشت نیست!",
             QMessageBox.Yes | QMessageBox.No
         )
         
@@ -940,23 +885,39 @@ class DocumentWidget(BaseWidget):
                 c.execute("SELECT id FROM documents WHERE doc_no = ?", [doc_no])
                 row_data = c.fetchone()
                 if not row_data:
-                    QMessageBox.warning(self, "خطا", "سند پیدا نشد!")
                     return
                 
                 doc_id = row_data['id'] if hasattr(row_data, 'keys') else row_data[0]
                 
                 # برگرداندن موجودی
-                c.execute("""
-                    SELECT product_id, quantity 
-                    FROM document_items 
-                    WHERE document_id = ?
-                """, [doc_id])
+                c.execute("SELECT product_id, quantity FROM document_items WHERE document_id = ?", [doc_id])
                 
                 for item in c.fetchall():
                     product_id = item['product_id'] if hasattr(item, 'keys') else item[0]
                     quantity = item['quantity'] if hasattr(item, 'keys') else item[1]
                     
-                    update_inventory(c, product_id, quantity, doc_type, reverse=True)
+                    if is_sales_type(doc_type):
+                        # فروش حذف میشه → موجودی زیاد میشه
+                        c.execute(
+                            "UPDATE products SET stock = stock + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                            [quantity, product_id]
+                        )
+                        c.execute("""
+                            UPDATE warehouse_stock 
+                            SET quantity = quantity + ?, updated_at = CURRENT_TIMESTAMP
+                            WHERE product_id = ?
+                        """, [quantity, product_id])
+                    else:
+                        # خرید حذف میشه → موجودی کم میشه
+                        c.execute(
+                            "UPDATE products SET stock = stock - ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                            [quantity, product_id]
+                        )
+                        c.execute("""
+                            UPDATE warehouse_stock 
+                            SET quantity = quantity - ?, updated_at = CURRENT_TIMESTAMP
+                            WHERE product_id = ?
+                        """, [quantity, product_id])
                 
                 c.execute('DELETE FROM document_items WHERE document_id = ?', [doc_id])
                 c.execute('DELETE FROM documents WHERE id = ?', [doc_id])
@@ -965,46 +926,31 @@ class DocumentWidget(BaseWidget):
             self.load_data()
             self.clear_details()
             self.document_changed.emit()
-            QMessageBox.information(self, "موفق", "✅ سند با موفقیت حذف شد!")
+            QMessageBox.information(self, "موفق", "✅ سند حذف شد!")
         
         except Exception as e:
-            logger.error(f"خطا در حذف سند: {e}", exc_info=True)
-            QMessageBox.warning(self, "خطا", f"❌ خطا در حذف سند: {str(e)}")
-    
-    def clear_details(self):
-        self.details_text.clear()
-        self.items_detail_table.setRowCount(0)
-        self.detail_status.setText("")
-        self.current_document = None
-        self.current_items = []
-    
-    # ============================================================
-    # محدودیت‌ها
-    # ============================================================
+            logger.error(f"خطا در حذف: {e}", exc_info=True)
+            QMessageBox.warning(self, "خطا", f"❌ {str(e)}")
     
     def check_document_limit(self) -> bool:
         if self.customer_name:
-            module_name = 'invoice' if self.current_doc_type == 'sales' else 'purchase'
+            module_name = 'invoice' if is_sales_type(self.current_doc_type) else 'purchase'
             allowed, current, limit, msg = ModuleLimitHelper.check_module_limit(
                 self.customer_name, module_name
             )
             if not allowed:
                 QMessageBox.warning(self, "خطا",
-                    f"❌ به سقف مجاز {limit} فاکتور رسیده‌اید!\n"
-                    "برای ثبت فاکتور جدید، لطفاً با مدیر سیستم تماس بگیرید.")
+                    f"❌ به سقف مجاز {limit} فاکتور رسیده‌اید!")
                 return False
-            elif limit > 0 and limit - current <= 3:
-                QMessageBox.warning(self, "هشدار",
-                    f"⚠️ فقط {limit - current} فاکتور دیگر تا سقف مجاز باقی مانده.")
         return True
     
-    # ============================================================
-    # چاپ
-    # ============================================================
+    # ═══════════════════════════════════════════════════════
+    # Print / PDF / Excel
+    # ═══════════════════════════════════════════════════════
     
     def print_document(self):
         if not self.current_document:
-            QMessageBox.warning(self, "خطا", "لطفاً یک سند را انتخاب کنید!")
+            QMessageBox.warning(self, "خطا", "یک سند انتخاب کنید!")
             return
         
         try:
@@ -1016,8 +962,8 @@ class DocumentWidget(BaseWidget):
             preview_dialog.paintRequested.connect(self._print_preview)
             preview_dialog.exec_()
         except Exception as e:
-            logger.error(f"خطا در چاپ: {e}", exc_info=True)
-            QMessageBox.warning(self, "خطا", f"❌ خطا در چاپ: {str(e)}")
+            logger.error(f"خطا در چاپ: {e}")
+            QMessageBox.warning(self, "خطا", f"❌ {str(e)}")
     
     def _print_preview(self, printer):
         html_content = self._generate_print_html()
@@ -1032,9 +978,8 @@ class DocumentWidget(BaseWidget):
         
         items = self.current_items
         tax_percent = int(self.tax_rate * 100)
-        
-        doc_type_text = "فاکتور فروش" if doc.get('doc_type') == 'sales' else "فاکتور خرید"
-        party_type = "مشتری" if doc.get('doc_type') == 'sales' else "تأمین‌کننده"
+        doc_type_text = get_doc_type_display(doc.get('doc_type', ''))
+        party_type = "مشتری" if is_sales_type(doc.get('doc_type', '')) else "تأمین‌کننده"
         
         html = f"""
         <html>
@@ -1054,70 +999,27 @@ class DocumentWidget(BaseWidget):
                 padding-bottom: 15px;
                 margin-bottom: 20px;
             }}
-            .company-name {{
-                font-size: 16pt;
-                font-weight: bold;
-                color: #273c75;
-            }}
-            .company-info {{
-                font-size: 9pt;
-                color: #555;
-                margin-top: 5px;
-            }}
-            .title {{
-                font-size: 14pt;
-                font-weight: bold;
-                color: #2c3e50;
-                margin-top: 10px;
-            }}
-            .info {{
-                margin-bottom: 15px;
-                padding: 10px;
-                background: #f8f9fa;
-                border-radius: 5px;
-            }}
+            .company-name {{ font-size: 16pt; font-weight: bold; color: #273c75; }}
+            .company-info {{ font-size: 9pt; color: #555; margin-top: 5px; }}
+            .title {{ font-size: 14pt; font-weight: bold; color: #2c3e50; margin-top: 10px; }}
+            .info {{ margin-bottom: 15px; padding: 10px; background: #f8f9fa; border-radius: 5px; }}
             .info table {{ width: 100%; }}
             .info td {{ padding: 3px 5px; }}
-            table.items {{
-                width: 100%;
-                border-collapse: collapse;
-                margin: 15px 0;
-            }}
-            table.items th {{
-                background-color: #273c75;
-                color: white;
-                padding: 8px;
-                text-align: center;
-            }}
-            table.items td {{
-                border: 1px solid #ddd;
-                padding: 6px;
-                text-align: center;
-            }}
-            .totals {{
-                margin-top: 15px;
-                padding: 10px;
-                background: #f0f0f0;
-                border-radius: 5px;
-            }}
-            .net {{
-                font-size: 13pt;
-                font-weight: bold;
-                color: #27ae60;
-            }}
+            table.items {{ width: 100%; border-collapse: collapse; margin: 15px 0; }}
+            table.items th {{ background-color: #273c75; color: white; padding: 8px; text-align: center; }}
+            table.items td {{ border: 1px solid #ddd; padding: 6px; text-align: center; }}
+            .totals {{ margin-top: 15px; padding: 10px; background: #f0f0f0; border-radius: 5px; }}
+            .net {{ font-size: 13pt; font-weight: bold; color: #27ae60; }}
             .footer {{
-                margin-top: 30px;
-                text-align: center;
-                font-size: 8pt;
-                color: #999;
-                border-top: 1px solid #ddd;
-                padding-top: 10px;
+                margin-top: 30px; text-align: center;
+                font-size: 8pt; color: #999;
+                border-top: 1px solid #ddd; padding-top: 10px;
             }}
         </style>
         </head>
         <body>
             <div class="header">
-                <div class="company-name">{self.company_info.get('company_name', 'شرکت حسابداری پارسه')}</div>
+                <div class="company-name">{self.company_info.get('company_name', 'شرکت')}</div>
                 <div class="company-info">
                     {f'تلفن: {self.company_info.get("company_phone", "")}' if self.company_info.get("company_phone") else ''}
                     {f'<br>آدرس: {self.company_info.get("company_address", "")}' if self.company_info.get("company_address") else ''}
@@ -1129,7 +1031,7 @@ class DocumentWidget(BaseWidget):
             <div class="info">
                 <table>
                     <tr>
-                        <td><b>تاریخ:</b> {safe_display_date(doc.get('date', '')) if doc.get('date') else ''}</td>
+                        <td><b>تاریخ:</b> {safe_display_date(doc.get('date', ''))}</td>
                         <td><b>{party_type}:</b> {doc.get('party_name', '')}</td>
                     </tr>
                 </table>
@@ -1137,7 +1039,7 @@ class DocumentWidget(BaseWidget):
             
             <table class="items">
                 <thead>
-                    <tr><th>ردیف</th><th>کالا</th><th>تعداد</th><th>قیمت واحد</th><th>جمع</th></tr>
+                    <tr><th>ردیف</th><th>کالا</th><th>تعداد</th><th>فی</th><th>جمع</th></tr>
                 </thead>
                 <tbody>
         """
@@ -1163,7 +1065,7 @@ class DocumentWidget(BaseWidget):
                     <tr><td><b>تخفیف:</b></td><td align="left">{doc.get('discount', 0):,.0f} ریال</td></tr>
                     <tr><td><b>مالیات ({tax_percent}%):</b></td><td align="left">{doc.get('tax', 0):,.0f} ریال</td></tr>
                     <tr><td colspan="2"><hr></td></tr>
-                    <tr><td><b>مبلغ قابل پرداخت:</b></td><td align="left" class="net">{doc.get('net_amount', 0):,.0f} ریال</td></tr>
+                    <tr><td><b>مبلغ نهایی:</b></td><td align="left" class="net">{doc.get('net_amount', 0):,.0f} ریال</td></tr>
                 </table>
             </div>
             
@@ -1178,206 +1080,47 @@ class DocumentWidget(BaseWidget):
     
     def save_as_pdf(self):
         if not self.current_document:
-            QMessageBox.warning(self, "خطا", "لطفاً یک سند را انتخاب کنید!")
-            return
-        
-        if not PDF_AVAILABLE:
-            QMessageBox.warning(self, "خطا",
-                "کتابخانه ReportLab یا PIL نصب نیست!\n"
-                "برای نصب: pip install reportlab pillow")
+            QMessageBox.warning(self, "خطا", "یک سند انتخاب کنید!")
             return
         
         default_name = f"{self.current_document.get('doc_no', 'snd')}_{datetime.now().strftime('%Y%m%d')}.pdf"
         file_path, _ = QFileDialog.getSaveFileName(
-            self, "ذخیره فاکتور به صورت PDF",
-            default_name, "PDF Files (*.pdf)"
+            self, "ذخیره PDF", default_name, "PDF Files (*.pdf)"
         )
         
         if not file_path:
             return
         
         try:
-            self._generate_pdf(file_path)
-            QMessageBox.information(self, "موفق", f"✅ فاکتور در {file_path} ذخیره شد!")
+            from PyQt5.QtPrintSupport import QPrinter
+            from PyQt5.QtGui import QTextDocument
+            from PyQt5.QtCore import QSizeF
+            
+            printer = QPrinter(QPrinter.ScreenResolution)
+            printer.setOutputFormat(QPrinter.PdfFormat)
+            printer.setOutputFileName(file_path)
+            printer.setPageSize(QPrinter.A4)
+            printer.setPageMargins(15, 15, 15, 15, QPrinter.Millimeter)
+            
+            doc = QTextDocument()
+            doc.setHtml(self._generate_print_html())
+            
+            rect = printer.pageRect(QPrinter.DevicePixel)
+            doc.setPageSize(QSizeF(rect.width(), rect.height()))
+            doc.print_(printer)
+            
+            QMessageBox.information(self, "موفق", f"✅ PDF ذخیره شد:\n{file_path}")
         except Exception as e:
-            logger.error(f"خطا در ذخیره PDF: {e}", exc_info=True)
-            QMessageBox.warning(self, "خطا", f"❌ خطا در ذخیره PDF: {str(e)}")
-    
-    def _generate_pdf(self, file_path):
-        doc = self.current_document
-        items = self.current_items
-        tax_percent = int(self.tax_rate * 100)
-        
-        try:
-            # بارگذاری فونت
-            font_path = "fonts/tahoma.ttf"
-            if not os.path.exists(font_path):
-                font_path = "C:/Windows/Fonts/tahoma.ttf"
-            if not os.path.exists(font_path):
-                font_path = "C:/Windows/Fonts/arial.ttf"
-            
-            pdfmetrics.registerFont(TTFont('PersianFont', font_path))
-            
-            def fa(text):
-                if text is None:
-                    text = ""
-                reshaped = arabic_reshaper.reshape(str(text))
-                return get_display(reshaped)
-            
-            styles = getSampleStyleSheet()
-            right_style = ParagraphStyle(
-                'Right', parent=styles['Normal'],
-                fontName='PersianFont', fontSize=10,
-                alignment=TA_RIGHT, leading=16
-            )
-            center_style = ParagraphStyle(
-                'Center', parent=styles['Normal'],
-                fontName='PersianFont', fontSize=12,
-                alignment=TA_CENTER, leading=18
-            )
-            bold_center_style = ParagraphStyle(
-                'BoldCenter', parent=center_style,
-                fontSize=14, fontName='PersianFont'
-            )
-            
-            doc_builder = SimpleDocTemplate(
-                file_path, pagesize=A4,
-                rightMargin=15*mm, leftMargin=15*mm,
-                topMargin=15*mm, bottomMargin=15*mm
-            )
-            
-            elements = []
-            
-            # هدر
-            elements.append(Paragraph(
-                fa(self.company_info.get('company_name', 'شرکت حسابداری پارسه')),
-                bold_center_style
-            ))
-            elements.append(Spacer(1, 5))
-            if self.company_info.get('company_phone'):
-                elements.append(Paragraph(
-                    fa(f"تلفن: {self.company_info.get('company_phone')}"),
-                    center_style
-                ))
-            if self.company_info.get('company_address'):
-                elements.append(Paragraph(
-                    fa(f"آدرس: {self.company_info.get('company_address')}"),
-                    center_style
-                ))
-            
-            elements.append(Spacer(1, 15))
-            
-            # اطلاعات سند
-            doc_type_text = "فاکتور فروش" if doc.get('doc_type') == 'sales' else "فاکتور خرید"
-            party_type = "مشتری" if doc.get('doc_type') == 'sales' else "تأمین‌کننده"
-            shamsi_date = safe_display_date(doc.get('date', '')) if doc.get('date') else ""
-            
-            info_data = [
-                [Paragraph(fa(f"شماره: {doc.get('doc_no', '')}"), right_style),
-                 Paragraph(fa(f"تاریخ: {shamsi_date}"), right_style)],
-                [Paragraph(fa(f"{party_type}: {doc.get('party_name', '')}"), right_style),
-                 Paragraph(fa(""), right_style)]
-            ]
-            
-            info_table = Table(info_data, colWidths=[doc_builder.width/2.0]*2)
-            info_table.setStyle(TableStyle([
-                ('FONTNAME', (0, 0), (-1, -1), 'PersianFont'),
-                ('ALIGN', (0, 0), (-1, -1), 'RIGHT'),
-                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-                ('BACKGROUND', (0, 0), (-1, -1), colors.Color(0.96, 0.96, 0.96)),
-                ('BOX', (0, 0), (-1, -1), 0.5, colors.grey),
-                ('INNERGRID', (0, 0), (-1, -1), 0.5, colors.grey),
-                ('TOPPADDING', (0, 0), (-1, -1), 6),
-                ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
-            ]))
-            elements.append(info_table)
-            elements.append(Spacer(1, 15))
-            
-            # جدول اقلام
-            items_data = [
-                [Paragraph(fa("ردیف"), right_style),
-                 Paragraph(fa("کالا"), right_style),
-                 Paragraph(fa("تعداد"), right_style),
-                 Paragraph(fa("قیمت واحد"), right_style),
-                 Paragraph(fa("جمع"), right_style)]
-            ]
-            
-            for i, item in enumerate(items, 1):
-                items_data.append([
-                    Paragraph(fa(str(i)), right_style),
-                    Paragraph(fa(item.get('product_name', '')), right_style),
-                    Paragraph(fa(f"{item.get('quantity', 0):,.2f}"), right_style),
-                    Paragraph(fa(f"{item.get('unit_price', 0):,.0f}"), right_style),
-                    Paragraph(fa(f"{item.get('total_price', 0):,.0f}"), right_style)
-                ])
-            
-            items_table = Table(items_data, colWidths=[
-                doc_builder.width*0.08, doc_builder.width*0.42,
-                doc_builder.width*0.15, doc_builder.width*0.15,
-                doc_builder.width*0.20
-            ])
-            items_table.setStyle(TableStyle([
-                ('FONTNAME', (0, 0), (-1, -1), 'PersianFont'),
-                ('ALIGN', (0, 0), (-1, -1), 'RIGHT'),
-                ('BACKGROUND', (0, 0), (-1, 0), colors.Color(0.15, 0.17, 0.46)),
-                ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
-                ('BOX', (0, 0), (-1, -1), 0.5, colors.grey),
-                ('INNERGRID', (0, 0), (-1, -1), 0.5, colors.grey),
-                ('TOPPADDING', (0, 0), (-1, -1), 6),
-                ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
-                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
-            ]))
-            elements.append(items_table)
-            elements.append(Spacer(1, 15))
-            
-            # جمع‌ها
-            totals_data = [
-                [Paragraph(fa("جمع کل:"), right_style), Paragraph(fa(f"{doc.get('total_amount', 0):,.0f}"), right_style)],
-                [Paragraph(fa("تخفیف:"), right_style), Paragraph(fa(f"{doc.get('discount', 0):,.0f}"), right_style)],
-                [Paragraph(fa(f"مالیات ({tax_percent}%):"), right_style), Paragraph(fa(f"{doc.get('tax', 0):,.0f}"), right_style)],
-            ]
-            
-            totals_table = Table(totals_data, colWidths=[doc_builder.width*0.7, doc_builder.width*0.3])
-            totals_table.setStyle(TableStyle([
-                ('FONTNAME', (0, 0), (-1, -1), 'PersianFont'),
-                ('ALIGN', (0, 0), (-1, -1), 'RIGHT'),
-                ('BACKGROUND', (0, 0), (-1, -1), colors.Color(0.96, 0.96, 0.96)),
-                ('BOX', (0, 0), (-1, -1), 0.5, colors.grey),
-                ('INNERGRID', (0, 0), (-1, -1), 0.5, colors.grey),
-                ('TOPPADDING', (0, 0), (-1, -1), 6),
-                ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
-            ]))
-            elements.append(totals_table)
-            elements.append(Spacer(1, 10))
-            
-            net_para = Paragraph(
-                fa(f"💵 مبلغ قابل پرداخت: {doc.get('net_amount', 0):,.0f} ریال"),
-                ParagraphStyle('Net', parent=right_style, fontSize=14, textColor=colors.green)
-            )
-            elements.append(net_para)
-            elements.append(Spacer(1, 20))
-            
-            footer_text = f"تاریخ چاپ: {datetime.now().strftime('%Y/%m/%d %H:%M')} | ImanAccount - حسابداری هوشمند"
-            elements.append(Paragraph(
-                fa(footer_text),
-                ParagraphStyle('Footer', parent=center_style, fontSize=8, textColor=colors.grey)
-            ))
-            
-            doc_builder.build(elements)
-        
-        except Exception as e:
-            logger.error(f"خطا در تولید PDF: {e}", exc_info=True)
-            raise
+            QMessageBox.warning(self, "خطا", f"❌ {str(e)}")
     
     def export_to_excel(self):
         if not self.current_document:
-            QMessageBox.warning(self, "خطا", "لطفاً یک سند را انتخاب کنید!")
+            QMessageBox.warning(self, "خطا", "یک سند انتخاب کنید!")
             return
         
         file_name, _ = QFileDialog.getSaveFileName(
-            self,
-            "ذخیره خروجی Excel",
-            f"{self.current_document.get('doc_no', 'snd')}_{datetime.now().strftime('%Y%m%d')}.csv",
+            self, "ذخیره Excel",
+            f"{self.current_document.get('doc_no', 'snd')}.csv",
             "CSV Files (*.csv)"
         )
         
@@ -1387,7 +1130,7 @@ class DocumentWidget(BaseWidget):
         try:
             with open(file_name, 'w', encoding='utf-8-sig', newline='') as f:
                 writer = csv.writer(f)
-                writer.writerow(["ردیف", "کد", "کالا", "تعداد", "قیمت واحد", "جمع"])
+                writer.writerow(["ردیف", "کد", "کالا", "تعداد", "فی", "جمع"])
                 
                 for i, item in enumerate(self.current_items, 1):
                     writer.writerow([
@@ -1398,31 +1141,442 @@ class DocumentWidget(BaseWidget):
                         item.get('unit_price', 0),
                         item.get('total_price', 0)
                     ])
-                
-                writer.writerow([])
-                writer.writerow(["شماره سند:", self.current_document.get('doc_no', '')])
-                writer.writerow(["تاریخ:", safe_display_date(self.current_document.get('date', '')) if self.current_document.get('date') else ''])
-                writer.writerow(["جمع کل:", f"{self.current_document.get('total_amount', 0):,.0f}"])
-                writer.writerow(["تخفیف:", f"{self.current_document.get('discount', 0):,.0f}"])
-                writer.writerow(["مالیات:", f"{self.current_document.get('tax', 0):,.0f}"])
-                writer.writerow(["مبلغ قابل پرداخت:", f"{self.current_document.get('net_amount', 0):,.0f}"])
             
-            QMessageBox.information(self, "موفق", f"✅ خروجی در {file_name} ذخیره شد!")
+            QMessageBox.information(self, "موفق", f"✅ ذخیره شد:\n{file_name}")
         except Exception as e:
-            logger.error(f"خطا در ذخیره: {e}", exc_info=True)
-            QMessageBox.warning(self, "خطا", f"❌ خطا در ذخیره: {str(e)}")
+            QMessageBox.warning(self, "خطا", f"❌ {str(e)}")
 
 
-# ============================================================
-# دیالوگ ایجاد/ویرایش سند
-# ============================================================
+# ═══════════════════════════════════════════════════════════
+# ReturnDialog — دیالوگ برگشت
+# ═══════════════════════════════════════════════════════════
+
+class ReturnDialog(BaseDialog):
+    """دیالوگ برگشت از فروش/خرید"""
+    
+    def __init__(self, document: dict, parent=None):
+        super().__init__(parent, base_width=800, base_height=650)
+        
+        self.document = document
+        self.original_items = []
+        self.return_items = []
+        
+        doc_type = document.get('doc_type', 'sales')
+        type_text = "فروش" if doc_type == 'sales' else "خرید"
+        
+        self.setWindowTitle(f"🔙 برگشت از {type_text} — سند {document.get('doc_no', '')}")
+        self.setModal(True)
+        
+        self._load_original_items()
+        self.setup_ui()
+        self.apply_theme()
+    
+    def _load_original_items(self):
+        """بارگذاری اقلام سند اصلی"""
+        try:
+            with get_db() as conn:
+                c = conn.cursor()
+                c.execute("""
+                    SELECT di.*, p.code as product_code, p.name as product_name
+                    FROM document_items di
+                    JOIN products p ON di.product_id = p.id
+                    WHERE di.document_id = ?
+                """, [self.document.get('id')])
+                
+                self.original_items = []
+                for row in c.fetchall():
+                    item = row_to_dict(row)
+                    # مقدار برگشت‌پذیر
+                    item['available'] = (item.get('quantity', 0) or 0) - (item.get('returned_qty', 0) or 0)
+                    self.original_items.append(item)
+        
+        except Exception as e:
+            logger.error(f"خطا در بارگذاری اقلام: {e}")
+    
+    def setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+        layout.setContentsMargins(15, 15, 15, 15)
+        
+        # هدر
+        header = QLabel(
+            f"<h3 style='color: #e74c3c; text-align: center;'>🔙 برگشت از سند</h3>"
+            f"<p style='text-align: center; color: #666;'>"
+            f"سند اصلی: <b>{self.document.get('doc_no', '')}</b> — "
+            f"{self.document.get('party_name', '')} — "
+            f"{safe_display_date(self.document.get('date', ''))}"
+            f"</p>"
+        )
+        header.setTextFormat(Qt.RichText)
+        layout.addWidget(header)
+        
+        # تاریخ برگشت
+        date_layout = QHBoxLayout()
+        date_layout.addWidget(QLabel("📅 تاریخ برگشت:"))
+        self.return_date = ShamsiDateEdit()
+        self.return_date.set_date(get_today_jalali())
+        self.return_date.setMinimumHeight(self.scaled(32))
+        date_layout.addWidget(self.return_date)
+        date_layout.addStretch()
+        layout.addLayout(date_layout)
+        
+        # جدول اقلام
+        layout.addWidget(QLabel("📦 اقلام قابل برگشت:"))
+        
+        self.items_table = QTableWidget()
+        self.items_table.setColumnCount(6)
+        self.items_table.setHorizontalHeaderLabels([
+            "کالا", "تعداد اصلی", "برگشتی قبلی", "قابل برگشت", "تعداد برگشت", "مبلغ"
+        ])
+        self.items_table.setAlternatingRowColors(True)
+        self.items_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.items_table.horizontalHeader().setStretchLastSection(True)
+        self.items_table.setColumnWidth(0, self.scaled(200))
+        self.items_table.setColumnWidth(1, self.scaled(90))
+        self.items_table.setColumnWidth(2, self.scaled(90))
+        self.items_table.setColumnWidth(3, self.scaled(90))
+        self.items_table.setColumnWidth(4, self.scaled(120))
+        
+        layout.addWidget(self.items_table, 1)
+        
+        # دلیل برگشت
+        reason_layout = QHBoxLayout()
+        reason_layout.addWidget(QLabel("📝 دلیل برگشت:"))
+        self.reason_input = QTextEdit()
+        self.reason_input.setPlaceholderText("مثال: کالای معیوب، اشتباه در سفارش...")
+        self.reason_input.setMaximumHeight(self.scaled(70))
+        reason_layout.addWidget(self.reason_input)
+        layout.addLayout(reason_layout)
+        
+        # خلاصه
+        self.summary_label = QLabel("💰 جمع برگشت: ۰ ریال")
+        self.summary_label.setStyleSheet("""
+            background: #fff3cd;
+            color: #856404;
+            padding: 10px;
+            border-radius: 6px;
+            font-weight: bold;
+            font-size: 12pt;
+        """)
+        self.summary_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.summary_label)
+        
+        # دکمه‌ها
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        
+        save_btn = QPushButton("✅ ثبت برگشت")
+        save_btn.setObjectName("successBtn")
+        save_btn.setMinimumHeight(self.scaled(42))
+        save_btn.setMinimumWidth(self.scaled(160))
+        save_btn.setStyleSheet("""
+            QPushButton {
+                background: #27ae60; color: white;
+                border: none; border-radius: 8px;
+                font-weight: bold; font-size: 12pt;
+            }
+        """)
+        save_btn.clicked.connect(self.accept)
+        btn_layout.addWidget(save_btn)
+        
+        cancel_btn = QPushButton("❌ انصراف")
+        cancel_btn.setObjectName("dangerBtn")
+        cancel_btn.setMinimumHeight(self.scaled(42))
+        cancel_btn.setMinimumWidth(self.scaled(120))
+        cancel_btn.setStyleSheet("""
+            QPushButton {
+                background: #e74c3c; color: white;
+                border: none; border-radius: 8px;
+                font-weight: bold; font-size: 12pt;
+            }
+        """)
+        cancel_btn.clicked.connect(self.reject)
+        btn_layout.addWidget(cancel_btn)
+        
+        layout.addLayout(btn_layout)
+        
+        # پر کردن جدول
+        self._populate_items()
+    
+    def _populate_items(self):
+        """پر کردن جدول اقلام"""
+        self.items_table.setRowCount(len(self.original_items))
+        self.return_spins = []
+        
+        font = QFont("Tahoma", self.font_size(10))
+        
+        for i, item in enumerate(self.original_items):
+            # کالا
+            name_item = QTableWidgetItem(
+                f"{item.get('product_code', '')} - {item.get('product_name', '')}"
+            )
+            name_item.setFont(font)
+            name_item.setFlags(name_item.flags() & ~Qt.ItemIsEditable)
+            self.items_table.setItem(i, 0, name_item)
+            
+            # تعداد اصلی
+            qty_item = QTableWidgetItem(f"{item.get('quantity', 0):,.2f}")
+            qty_item.setFont(font)
+            qty_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            qty_item.setFlags(qty_item.flags() & ~Qt.ItemIsEditable)
+            self.items_table.setItem(i, 1, qty_item)
+            
+            # برگشتی قبلی
+            returned_item = QTableWidgetItem(f"{item.get('returned_qty', 0) or 0:,.2f}")
+            returned_item.setFont(font)
+            returned_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            returned_item.setFlags(returned_item.flags() & ~Qt.ItemIsEditable)
+            self.items_table.setItem(i, 2, returned_item)
+            
+            # قابل برگشت
+            available_item = QTableWidgetItem(f"{item['available']:,.2f}")
+            available_item.setFont(font)
+            available_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            available_item.setForeground(QColor('#27ae60'))
+            available_item.setFlags(available_item.flags() & ~Qt.ItemIsEditable)
+            self.items_table.setItem(i, 3, available_item)
+            
+            # تعداد برگشت (قابل ویرایش)
+            spin = QDoubleSpinBox()
+            spin.setRange(0, item['available'])
+            spin.setValue(item['available'])
+            spin.setDecimals(2)
+            spin.setSingleStep(1)
+            spin.setFont(font)
+            spin.setStyleSheet("""
+                QDoubleSpinBox {
+                    background: white;
+                    border: 2px solid #1976D2;
+                    border-radius: 4px;
+                    padding: 4px;
+                    min-height: 26px;
+                }
+            """)
+            spin.valueChanged.connect(lambda v, r=i: self._update_row(r, v))
+            self.items_table.setCellWidget(i, 4, spin)
+            self.return_spins.append(spin)
+            
+            # مبلغ
+            amount = (item.get('unit_price', 0) or 0) * item['available']
+            amount_item = QTableWidgetItem(f"{amount:,.0f}")
+            amount_item.setFont(font)
+            amount_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            amount_item.setFlags(amount_item.flags() & ~Qt.ItemIsEditable)
+            self.items_table.setItem(i, 5, amount_item)
+        
+        self._update_summary()
+    
+    def _update_row(self, row: int, value: float):
+        """بروزرسانی یک ردیف"""
+        item = self.original_items[row]
+        amount = (item.get('unit_price', 0) or 0) * value
+        self.items_table.item(row, 5).setText(f"{amount:,.0f}")
+        self._update_summary()
+    
+    def _update_summary(self):
+        """بروزرسانی خلاصه"""
+        total = 0
+        for i, item in enumerate(self.original_items):
+            qty = self.return_spins[i].value()
+            price = item.get('unit_price', 0) or 0
+            total += qty * price
+        
+        self.summary_label.setText(f"💰 جمع برگشت: {total:,.0f} ریال")
+    
+    def accept(self):
+        """ثبت برگشت"""
+        # جمع‌آوری اقلام برگشتی
+        items_to_return = []
+        total_amount = 0
+        
+        for i, item in enumerate(self.original_items):
+            qty = self.return_spins[i].value()
+            if qty <= 0:
+                continue
+            
+            price = item.get('unit_price', 0) or 0
+            total = qty * price
+            
+            items_to_return.append({
+                'product_id': item.get('product_id'),
+                'quantity': qty,
+                'unit_price': price,
+                'total_price': total,
+                'original_item_id': item.get('id'),
+            })
+            
+            total_amount += total
+        
+        if not items_to_return:
+            QMessageBox.warning(self, "خطا", "حداقل یک قلم را برای برگشت انتخاب کنید!")
+            return
+        
+        reason = self.reason_input.toPlainText().strip()
+        return_date = self.return_date.get_shamsi()
+        
+        try:
+            # محاسبه مالیات و تخفیف نسبی
+            original_total = self.document.get('total_amount', 0) or 0
+            if original_total > 0:
+                ratio = total_amount / original_total
+                original_discount = self.document.get('discount', 0) or 0
+                original_tax = self.document.get('tax', 0) or 0
+                
+                discount = int(original_discount * ratio)
+                tax = int(original_tax * ratio)
+            else:
+                discount = 0
+                tax = 0
+            
+            net_amount = total_amount - discount + tax
+            
+            # تعیین نوع سند برگشتی
+            doc_type = self.document.get('doc_type', 'sales')
+            return_type = 'sales_return' if doc_type == 'sales' else 'purchase_return'
+            prefix = get_doc_type_prefix(return_type)
+            
+            with get_db() as conn:
+                c = conn.cursor()
+                
+                # شماره سند
+                c.execute(f"""
+                    SELECT MAX(CAST(SUBSTR(doc_no, 4) AS INTEGER))
+                    FROM documents WHERE doc_no LIKE '{prefix}%'
+                """)
+                max_no = c.fetchone()[0] or 0
+                doc_no = f"{prefix}{(max_no + 1):06d}"
+                
+                # درج سند
+                c.execute("""
+                    INSERT INTO documents
+                    (doc_no, doc_type, date, party_id, total_amount, discount, tax, net_amount, description)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, [
+                    doc_no,
+                    return_type,
+                    return_date,
+                    self.document.get('party_id'),
+                    total_amount,
+                    discount,
+                    tax,
+                    net_amount,
+                    f"برگشت از {self.document.get('doc_no', '')}: {reason}"
+                ])
+                
+                return_doc_id = c.lastrowid
+                
+                # درج اقلام برگشتی
+                for item in items_to_return:
+                    c.execute("""
+                        INSERT INTO document_items
+                        (document_id, product_id, quantity, unit_price, total_price)
+                        VALUES (?, ?, ?, ?, ?)
+                    """, [
+                        return_doc_id,
+                        item['product_id'],
+                        item['quantity'],
+                        item['unit_price'],
+                        item['total_price']
+                    ])
+                    
+                    # بروزرسانی returned_qty در سند اصلی
+                    c.execute("""
+                        UPDATE document_items
+                        SET returned_qty = COALESCE(returned_qty, 0) + ?,
+                            return_doc_id = ?
+                        WHERE id = ?
+                    """, [item['quantity'], return_doc_id, item['original_item_id']])
+                    
+                    # بروزرسانی انبار
+                    if doc_type == 'sales':
+                        # برگشت از فروش → موجودی زیاد میشه
+                        c.execute(
+                            "UPDATE products SET stock = stock + ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                            [item['quantity'], item['product_id']]
+                        )
+                        c.execute("""
+                            UPDATE warehouse_stock 
+                            SET quantity = quantity + ?, updated_at = CURRENT_TIMESTAMP
+                            WHERE product_id = ?
+                        """, [item['quantity'], item['product_id']])
+                    else:
+                        # برگشت از خرید → موجودی کم میشه
+                        c.execute(
+                            "UPDATE products SET stock = stock - ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                            [item['quantity'], item['product_id']]
+                        )
+                        c.execute("""
+                            UPDATE warehouse_stock 
+                            SET quantity = quantity - ?, updated_at = CURRENT_TIMESTAMP
+                            WHERE product_id = ?
+                        """, [item['quantity'], item['product_id']])
+                
+                # ثبت در جدول ربط
+                c.execute("""
+                    INSERT INTO document_returns
+                    (original_doc_id, return_doc_id, reason)
+                    VALUES (?, ?, ?)
+                """, [self.document.get('id'), return_doc_id, reason])
+                
+                conn.commit()
+            
+            QMessageBox.information(
+                self, "موفق",
+                f"✅ برگشت ثبت شد!\n"
+                f"شماره سند برگشتی: {doc_no}\n"
+                f"مبلغ: {net_amount:,.0f} ریال"
+            )
+            
+            super().accept()
+        
+        except Exception as e:
+            logger.error(f"خطا در برگشت: {e}", exc_info=True)
+            QMessageBox.warning(self, "خطا", f"❌ {str(e)}")
+    
+    def apply_theme(self):
+        """تم ساده"""
+        self.setStyleSheet("""
+            QDialog { background: #f5f6fa; }
+            QLabel { color: #1a1a2e; }
+            QTableWidget {
+                background: white;
+                color: #1a1a2e;
+                border: 1px solid #dcdde1;
+                border-radius: 6px;
+                gridline-color: #dcdde1;
+            }
+            QHeaderView::section {
+                background: #e8e8e8;
+                color: #1a1a2e;
+                padding: 8px;
+                border: none;
+                font-weight: bold;
+            }
+            QLineEdit, QTextEdit, QComboBox {
+                background: white;
+                color: #1a1a2e;
+                border: 1px solid #dcdde1;
+                border-radius: 6px;
+                padding: 6px 10px;
+                min-height: 28px;
+            }
+            QLineEdit:focus, QTextEdit:focus, QComboBox:focus {
+                border: 2px solid #1976D2;
+            }
+        """)
+
+
+# ═══════════════════════════════════════════════════════════
+# DocumentDialog — دیالوگ سند جدید/ویرایش
+# ═══════════════════════════════════════════════════════════
 
 class DocumentDialog(BaseDialog):
-    """دیالوگ ایجاد و ویرایش سند با به‌روزرسانی صحیح انبار"""
+    """دیالوگ سند جدید/ویرایش"""
     
     def __init__(self, products, parties, doc_type, parent=None,
                  customer_name="", tax_rate=0.09, doc_id=None):
-        super().__init__(parent, base_width=850, base_height=700)
+        super().__init__(parent, base_width=900, base_height=750)
+        
         self.products = products
         self.parties = parties
         self.doc_type = doc_type
@@ -1438,11 +1592,8 @@ class DocumentDialog(BaseDialog):
         self._net_amount = 0
         self._editing = doc_id is not None
         
-        doc_type_name = "فروش" if doc_type == 'sales' else "خرید"
-        self.setWindowTitle(
-            f"✏️ ویرایش سند {doc_type_name}" if self._editing
-            else f"➕ سند جدید {doc_type_name}"
-        )
+        type_text = get_doc_type_display(doc_type)
+        self.setWindowTitle(f"{'✏️ ویرایش' if self._editing else '➕'} {type_text}")
         self.setModal(True)
         
         self.setup_ui()
@@ -1452,16 +1603,34 @@ class DocumentDialog(BaseDialog):
         
         self.apply_theme()
     
+    def scaled(self, value):
+        return self.screen_manager.get_scaled(value)
+    
+    def spacing(self, value=10):
+        return self.screen_manager.get_spacing(value)
+    
+    def margin(self, value=10):
+        return self.screen_manager.get_margin(value)
+    
+    def font_size(self, size):
+        return self.screen_manager.get_font_size(size)
+    
+    def create_button(self, text, object_name=""):
+        btn = QPushButton(text)
+        if object_name:
+            btn.setObjectName(object_name)
+        btn.setMinimumHeight(self.scaled(32))
+        return btn
+    
     def setup_ui(self):
         layout = QVBoxLayout(self)
-        layout.setSpacing(self.spacing(10))
-        layout.setContentsMargins(self.margin(10), self.margin(10),
-                                  self.margin(10), self.margin(10))
+        layout.setSpacing(10)
+        layout.setContentsMargins(15, 15, 15, 15)
         
-        # اطلاعات اصلی
+        # اطلاعات سند
         info_group = QGroupBox("📋 اطلاعات سند")
         info_layout = QHBoxLayout(info_group)
-        info_layout.setSpacing(self.spacing(10))
+        info_layout.setSpacing(10)
         
         self.date = ShamsiDateEdit()
         self.date.setMinimumHeight(self.scaled(32))
@@ -1475,7 +1644,7 @@ class DocumentDialog(BaseDialog):
             self.party_combo.addItem(
                 f"{p.get('code', '')} - {p.get('name', '')}", p.get('id')
             )
-        info_layout.addWidget(QLabel("🏢 طرف حساب:"))
+        info_layout.addWidget(QLabel("👤 طرف حساب:"))
         info_layout.addWidget(self.party_combo)
         
         info_layout.addStretch()
@@ -1484,32 +1653,28 @@ class DocumentDialog(BaseDialog):
         # اقلام
         items_group = QGroupBox("📦 اقلام سند")
         items_layout = QVBoxLayout(items_group)
-        items_layout.setSpacing(self.spacing(8))
         
         self.items_table = QTableWidget()
         self.items_table.setColumnCount(7)
         self.items_table.setHorizontalHeaderLabels([
             "کد", "کالا", "تعداد", "قیمت واحد", "جمع", "موجودی", "عملیات"
         ])
-        self.items_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.items_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.items_table.horizontalHeader().setStretchLastSection(True)
         self.items_table.setAlternatingRowColors(True)
-        self.items_table.setMinimumHeight(self.scaled(200))
+        self.items_table.horizontalHeader().setStretchLastSection(True)
+        self.items_table.setMinimumHeight(self.scaled(250))
         items_layout.addWidget(self.items_table)
         
         btn_row = QHBoxLayout()
-        btn_row.setSpacing(self.spacing(8))
         
         add_btn = self.create_button("➕ افزودن کالا", "successBtn")
         add_btn.clicked.connect(self.add_product_row)
         btn_row.addWidget(add_btn)
         
-        remove_btn = self.create_button("🗑️ حذف انتخاب", "dangerBtn")
+        remove_btn = self.create_button("🗑️ حذف", "dangerBtn")
         remove_btn.clicked.connect(self.remove_selected_row)
         btn_row.addWidget(remove_btn)
         
-        clear_btn = self.create_button("🧹 پاک کردن همه", "warningBtn")
+        clear_btn = self.create_button("🧹 پاک کردن", "warningBtn")
         clear_btn.clicked.connect(self.clear_all_rows)
         btn_row.addWidget(clear_btn)
         
@@ -1521,32 +1686,28 @@ class DocumentDialog(BaseDialog):
         # جمع‌ها
         totals_group = QGroupBox("💰 جمع‌ها")
         totals_layout = QGridLayout(totals_group)
-        totals_layout.setSpacing(self.spacing(10))
-        totals_layout.setVerticalSpacing(self.spacing(8))
         
         totals_layout.addWidget(QLabel("جمع کل:"), 0, 0, Qt.AlignRight)
         self.total_label = QLabel("۰")
-        self.total_label.setStyleSheet("font-weight: bold; font-size: 12pt; color: #2c3e50;")
+        self.total_label.setStyleSheet("font-weight: bold; font-size: 12pt;")
         self.total_label.setAlignment(Qt.AlignRight)
         totals_layout.addWidget(self.total_label, 0, 1)
         
-        totals_layout.addWidget(QLabel("تخفیف (ریال):"), 1, 0, Qt.AlignRight)
-        self.discount_input = QLineEdit()
-        self.discount_input.setPlaceholderText("۰")
+        totals_layout.addWidget(QLabel("تخفیف:"), 1, 0, Qt.AlignRight)
+        self.discount_input = QLineEdit("0")
         self.discount_input.setAlignment(Qt.AlignRight)
         self.discount_input.setMaximumWidth(self.scaled(150))
-        self.discount_input.setMinimumHeight(self.scaled(32))
         self.discount_input.textChanged.connect(self.calculate_totals)
         totals_layout.addWidget(self.discount_input, 1, 1)
         
-        tax_percent = int(self.tax_rate * 100)
-        totals_layout.addWidget(QLabel(f"مالیات ({tax_percent}%):"), 2, 0, Qt.AlignRight)
+        tax_pct = int(self.tax_rate * 100)
+        totals_layout.addWidget(QLabel(f"مالیات ({tax_pct}%):"), 2, 0, Qt.AlignRight)
         self.tax_label = QLabel("۰")
         self.tax_label.setStyleSheet("color: #e67e22; font-weight: bold;")
         self.tax_label.setAlignment(Qt.AlignRight)
         totals_layout.addWidget(self.tax_label, 2, 1)
         
-        totals_layout.addWidget(QLabel("مبلغ قابل پرداخت:"), 3, 0, Qt.AlignRight)
+        totals_layout.addWidget(QLabel("مبلغ نهایی:"), 3, 0, Qt.AlignRight)
         self.net_label = QLabel("۰ ریال")
         self.net_label.setStyleSheet("font-weight: bold; font-size: 14pt; color: #27ae60;")
         self.net_label.setAlignment(Qt.AlignRight)
@@ -1560,62 +1721,31 @@ class DocumentDialog(BaseDialog):
         btn_layout.addStretch()
         
         save_btn = self.create_button("💾 ذخیره", "successBtn")
-        save_btn.setMinimumHeight(self.scaled(40))
-        save_btn.setMinimumWidth(self.scaled(120))
+        save_btn.setMinimumHeight(self.scaled(42))
+        save_btn.setMinimumWidth(self.scaled(130))
         save_btn.clicked.connect(self.save_document)
         btn_layout.addWidget(save_btn)
         
         cancel_btn = self.create_button("❌ انصراف", "dangerBtn")
-        cancel_btn.setMinimumHeight(self.scaled(40))
+        cancel_btn.setMinimumHeight(self.scaled(42))
         cancel_btn.setMinimumWidth(self.scaled(120))
         cancel_btn.clicked.connect(self.reject)
         btn_layout.addWidget(cancel_btn)
         
         layout.addLayout(btn_layout)
-        
-        if not self.products:
-            add_btn.setEnabled(False)
-            add_btn.setToolTip("هیچ کالایی در سیستم وجود ندارد!")
-    
-    # ============================================================
-    # توابع کمکی
-    # ============================================================
-    
-    def scaled(self, value):
-        return self.screen_manager.get_scaled(value)
-    
-    def spacing(self, value=10):
-        return self.screen_manager.get_spacing(value)
-    
-    def margin(self, value=10):
-        return self.screen_manager.get_margin(value)
-    
-    def create_button(self, text, object_name=""):
-        btn = QPushButton(text)
-        if object_name:
-            btn.setObjectName(object_name)
-        btn.setMinimumHeight(self.scaled(32))
-        return btn
-    
-    # ============================================================
-    # مدیریت اقلام
-    # ============================================================
     
     def add_product_row(self, product_data=None):
         if not self.products:
-            QMessageBox.warning(self, "خطا",
-                "⚠️ هیچ کالایی در سیستم وجود ندارد!\n"
-                "لطفاً ابتدا از بخش انبار کالا تعریف کنید.")
+            QMessageBox.warning(self, "خطا", "هیچ کالایی وجود ندارد!")
             return
         
         row = self.items_table.rowCount()
         self.items_table.insertRow(row)
-        self.items_table.setRowHeight(row, self.scaled(35))
+        self.items_table.setRowHeight(row, self.scaled(38))
         
         # کد
         code_label = QLabel("-")
         code_label.setAlignment(Qt.AlignCenter)
-        code_label.setStyleSheet("font-weight: bold; color: #273c75;")
         self.items_table.setCellWidget(row, 0, code_label)
         
         # کالا
@@ -1633,61 +1763,46 @@ class DocumentDialog(BaseDialog):
         self.items_table.setCellWidget(row, 1, combo)
         
         # تعداد
-        qty_spin = QDoubleSpinBox()
-        qty_spin.setRange(0.01, 999999)
-        qty_spin.setValue(1)
-        qty_spin.setDecimals(2)
-        qty_spin.setSingleStep(1)
-        qty_spin.valueChanged.connect(lambda v, r=row: self.calculate_row_total(r))
-        self.items_table.setCellWidget(row, 2, qty_spin)
+        qty = QDoubleSpinBox()
+        qty.setRange(0.01, 999999)
+        qty.setValue(1)
+        qty.setDecimals(2)
+        qty.valueChanged.connect(lambda v, r=row: self.calculate_row_total(r))
+        self.items_table.setCellWidget(row, 2, qty)
         
         # قیمت
-        price_edit = QLineEdit()
-        price_edit.setAlignment(Qt.AlignRight)
-        price_edit.setPlaceholderText("فی")
-        price_edit.setStyleSheet("border: 1px solid #ccc; border-radius: 4px; padding: 5px;")
-        price_edit.textChanged.connect(lambda t, r=row: self.calculate_row_total(r))
-        self.items_table.setCellWidget(row, 3, price_edit)
+        price = QLineEdit()
+        price.setAlignment(Qt.AlignRight)
+        price.setPlaceholderText("فی")
+        price.textChanged.connect(lambda t, r=row: self.calculate_row_total(r))
+        self.items_table.setCellWidget(row, 3, price)
         
         # جمع
-        total_label = QLabel("۰")
-        total_label.setAlignment(Qt.AlignRight)
-        total_label.setStyleSheet("font-weight: bold; color: #27ae60;")
-        self.items_table.setCellWidget(row, 4, total_label)
+        total = QLabel("۰")
+        total.setAlignment(Qt.AlignRight)
+        total.setStyleSheet("font-weight: bold; color: #27ae60;")
+        self.items_table.setCellWidget(row, 4, total)
         
         # موجودی
         stock_label = QLabel("")
         stock_label.setAlignment(Qt.AlignCenter)
-        stock_label.setStyleSheet("font-size: 9pt;")
         self.items_table.setCellWidget(row, 5, stock_label)
         
         # حذف
-        remove_btn = QPushButton("🗑️")
-        remove_btn.setMaximumWidth(self.scaled(40))
-        remove_btn.setMinimumHeight(self.scaled(30))
-        remove_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #e74c3c;
-                color: white;
-                border: none;
-                border-radius: 4px;
-            }
-            QPushButton:hover { background-color: #c0392b; }
-        """)
-        remove_btn.clicked.connect(lambda checked, r=row: self.remove_row(r))
-        self.items_table.setCellWidget(row, 6, remove_btn)
+        del_btn = QPushButton("🗑️")
+        del_btn.setMaximumWidth(self.scaled(40))
+        del_btn.setStyleSheet("background: #e74c3c; color: white; border-radius: 4px;")
+        del_btn.clicked.connect(lambda: self.remove_row(row))
+        self.items_table.setCellWidget(row, 6, del_btn)
         
         if product_data:
-            combo_idx = combo.findData(product_data.get('product_id'))
-            if combo_idx >= 0:
-                combo.setCurrentIndex(combo_idx)
-            qty_spin.setValue(product_data.get('quantity', 1))
-            price_edit.setText(f"{int(product_data.get('unit_price', 0)):,}")
-        else:
-            self.on_product_changed(row)
+            idx = combo.findData(product_data.get('product_id'))
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+            qty.setValue(product_data.get('quantity', 1))
+            price.setText(f"{int(product_data.get('unit_price', 0)):,}")
     
     def on_product_changed(self, row):
-        """هنگام تغییر کالا — چک موجودی واقعی از warehouse_stock"""
         combo = self.items_table.cellWidget(row, 1)
         if not combo or combo.currentIndex() <= 0:
             return
@@ -1697,34 +1812,24 @@ class DocumentDialog(BaseDialog):
         if not product:
             return
         
-        # کد
         code_label = self.items_table.cellWidget(row, 0)
         if code_label:
             code_label.setText(product.get('code', ''))
         
-        # موجودی
         stock_label = self.items_table.cellWidget(row, 5)
-        qty_spin = self.items_table.cellWidget(row, 2)
-        price_edit = self.items_table.cellWidget(row, 3)
-        
-        real_stock = product.get('real_stock', product.get('stock', 0)) or 0
-        current_qty = qty_spin.value() if qty_spin else 0
-        
-        if self.doc_type == "sales":
-            if real_stock <= 0:
-                stock_label.setText("⚠️ ناموجود")
-                stock_label.setStyleSheet("color: #e74c3c; font-weight: bold; font-size: 9pt;")
-            elif current_qty > real_stock:
-                stock_label.setText(f"⚠️ موجودی: {real_stock:,.2f}")
-                stock_label.setStyleSheet("color: #e67e22; font-weight: bold; font-size: 9pt;")
+        if stock_label:
+            stock = product.get('real_stock', product.get('stock', 0)) or 0
+            if is_sales_type(self.doc_type):
+                if stock <= 0:
+                    stock_label.setText("⚠️ ناموجود")
+                    stock_label.setStyleSheet("color: #e74c3c; font-weight: bold;")
+                else:
+                    stock_label.setText(f"✅ {stock:,.2f}")
+                    stock_label.setStyleSheet("color: #27ae60;")
             else:
-                stock_label.setText(f"✅ {real_stock:,.2f}")
-                stock_label.setStyleSheet("color: #27ae60; font-weight: bold; font-size: 9pt;")
-        else:
-            stock_label.setText(f"📦 {real_stock:,.2f}")
-            stock_label.setStyleSheet("color: #3498db; font-weight: bold; font-size: 9pt;")
+                stock_label.setText(f"📦 {stock:,.2f}")
         
-        # قیمت
+        price_edit = self.items_table.cellWidget(row, 3)
         if price_edit and not price_edit.text():
             price = product.get('price', 0)
             price_edit.setText(f"{int(price):,}")
@@ -1732,18 +1837,19 @@ class DocumentDialog(BaseDialog):
         self.calculate_row_total(row)
     
     def calculate_row_total(self, row):
-        qty_spin = self.items_table.cellWidget(row, 2)
-        price_edit = self.items_table.cellWidget(row, 3)
-        total_label = self.items_table.cellWidget(row, 4)
+        qty = self.items_table.cellWidget(row, 2)
+        price = self.items_table.cellWidget(row, 3)
+        total = self.items_table.cellWidget(row, 4)
         
-        if qty_spin and price_edit and total_label:
+        if qty and price and total:
             try:
-                qty = qty_spin.value()
-                price_text = price_edit.text().replace(',', '').strip()
-                total = qty * (int(float(price_text)) if price_text else 0)
-                total_label.setText(f"{total:,.0f}")
+                q = qty.value()
+                p_text = price.text().replace(',', '').strip()
+                p = int(float(p_text)) if p_text else 0
+                t = q * p
+                total.setText(f"{t:,.0f}")
             except Exception:
-                total_label.setText("۰")
+                total.setText("۰")
         
         self.calculate_totals()
     
@@ -1758,30 +1864,20 @@ class DocumentDialog(BaseDialog):
             self.remove_row(row)
     
     def clear_all_rows(self):
-        if self.items_table.rowCount() == 0:
-            return
-        
-        reply = QMessageBox.question(self, "تأیید",
-            "آیا از پاک کردن همه اقلام اطمینان دارید؟",
-            QMessageBox.Yes | QMessageBox.No)
-        
-        if reply == QMessageBox.Yes:
+        if QMessageBox.question(self, "تأیید", "همه اقلام پاک شوند؟",
+                                QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
             self.items_table.setRowCount(0)
             self.calculate_totals()
     
     def reindex_rows(self):
         for row in range(self.items_table.rowCount()):
-            remove_btn = self.items_table.cellWidget(row, 6)
-            if remove_btn:
+            btn = self.items_table.cellWidget(row, 6)
+            if btn:
                 try:
-                    remove_btn.clicked.disconnect()
+                    btn.clicked.disconnect()
                 except Exception:
                     pass
-                remove_btn.clicked.connect(lambda checked, r=row: self.remove_row(r))
-    
-    # ============================================================
-    # محاسبات
-    # ============================================================
+                btn.clicked.connect(lambda checked, r=row: self.remove_row(r))
     
     def calculate_totals(self):
         total = 0
@@ -1808,67 +1904,43 @@ class DocumentDialog(BaseDialog):
         self._discount = discount
         self._tax = tax
         self._net_amount = net
-    
-    # ============================================================
-    # بارگذاری داده ویرایش
-    # ============================================================
+        
+        return total, tax
     
     def load_document_data(self):
         try:
             with get_db() as conn:
                 c = conn.cursor()
-                
                 c.execute('SELECT * FROM documents WHERE id = ?', [self.doc_id])
-                row = c.fetchone()
-                if not row:
+                doc = row_to_dict(c.fetchone())
+                if not doc:
                     return
-                doc = row_to_dict(row)
                 
                 if doc.get('date'):
                     self.date.set_date(doc.get('date'))
                 
-                party_idx = self.party_combo.findData(doc.get('party_id'))
-                if party_idx >= 0:
-                    self.party_combo.setCurrentIndex(party_idx)
+                idx = self.party_combo.findData(doc.get('party_id'))
+                if idx >= 0:
+                    self.party_combo.setCurrentIndex(idx)
                 
                 if doc.get('discount'):
                     self.discount_input.setText(f"{int(doc.get('discount')):,}")
                 
                 c.execute("""
-                    SELECT product_id, quantity, unit_price, total_price
-                    FROM document_items
-                    WHERE document_id = ?
+                    SELECT product_id, quantity, unit_price
+                    FROM document_items WHERE document_id = ?
                 """, [self.doc_id])
                 
                 for item in c.fetchall():
-                    if hasattr(item, 'keys'):
-                        item_dict = {
-                            'product_id': item['product_id'],
-                            'quantity': item['quantity'],
-                            'unit_price': item['unit_price'],
-                            'total_price': item['total_price']
-                        }
-                    else:
-                        item_dict = {
-                            'product_id': item[0],
-                            'quantity': item[1],
-                            'unit_price': item[2],
-                            'total_price': item[3]
-                        }
-                    self.add_product_row(item_dict)
+                    self.add_product_row(row_to_dict(item))
                 
                 self.calculate_totals()
-        
         except Exception as e:
-            logger.error(f"خطا در بارگذاری سند: {e}", exc_info=True)
-    
-    # ============================================================
-    # ذخیره
-    # ============================================================
+            logger.error(f"خطا در بارگذاری: {e}")
     
     def save_document(self):
         if self.party_combo.currentIndex() < 0:
-            QMessageBox.warning(self, "خطا", "لطفاً طرف حساب را انتخاب کنید!")
+            QMessageBox.warning(self, "خطا", "طرف حساب را انتخاب کنید!")
             return
         
         if self.items_table.rowCount() == 0:
@@ -1879,31 +1951,33 @@ class DocumentDialog(BaseDialog):
         items = []
         for row in range(self.items_table.rowCount()):
             combo = self.items_table.cellWidget(row, 1)
-            qty_spin = self.items_table.cellWidget(row, 2)
-            price_edit = self.items_table.cellWidget(row, 3)
+            qty = self.items_table.cellWidget(row, 2)
+            price = self.items_table.cellWidget(row, 3)
             
             if not combo or combo.currentIndex() <= 0:
                 continue
             
-            product_id = combo.currentData()
-            qty = qty_spin.value() if qty_spin else 0
-            price_text = price_edit.text().replace(',', '').strip() if price_edit else "0"
-            unit_price = int(float(price_text)) if price_text else 0
-            
-            if qty > 0 and unit_price > 0:
-                items.append({
-                    'product_id': product_id,
-                    'quantity': qty,
-                    'unit_price': unit_price,
-                    'total_price': qty * unit_price
-                })
+            try:
+                q = qty.value() if qty else 0
+                p_text = price.text().replace(',', '').strip() if price else "0"
+                p = int(float(p_text)) if p_text else 0
+                
+                if q > 0 and p > 0:
+                    items.append({
+                        'product_id': combo.currentData(),
+                        'quantity': q,
+                        'unit_price': p,
+                        'total_price': q * p
+                    })
+            except Exception:
+                continue
         
         if not items:
             QMessageBox.warning(self, "خطا", "هیچ آیتم معتبری وجود ندارد!")
             return
         
-        # بررسی موجودی کافی برای فروش
-        if self.doc_type == 'sales':
+        # چک موجودی برای فروش
+        if is_sales_type(self.doc_type):
             with get_db() as conn:
                 c = conn.cursor()
                 for item in items:
@@ -1911,56 +1985,48 @@ class DocumentDialog(BaseDialog):
                         SELECT COALESCE(SUM(quantity), 0) FROM warehouse_stock
                         WHERE product_id = ?
                     """, [item['product_id']])
-                    row = c.fetchone()
-                    available = float(row[0]) if row else 0
+                    row_data = c.fetchone()
+                    available = float(row_data[0]) if row_data else 0
                     
                     if self._editing:
                         c.execute("""
-                            SELECT COALESCE(quantity, 0) 
-                            FROM document_items 
+                            SELECT COALESCE(quantity, 0) FROM document_items
                             WHERE document_id = ? AND product_id = ?
                         """, [self.doc_id, item['product_id']])
-                        old_row = c.fetchone()
-                        old_qty = float(old_row[0]) if old_row else 0
-                        available += old_qty
+                        old = c.fetchone()
+                        if old:
+                            available += float(old[0] or 0)
                     
                     if item['quantity'] > available:
-                        product = next(
-                            (p for p in self.products if p['id'] == item['product_id']),
-                            None
-                        )
-                        pname = product['name'] if product else f"کالا #{item['product_id']}"
-                        QMessageBox.warning(
-                            self, "موجودی ناکافی",
-                            f"⚠️ موجودی کالای '{pname}' کافی نیست!\n\n"
-                            f"موجودی فعلی: {available:,.2f}\n"
-                            f"درخواستی: {item['quantity']:,.2f}"
-                        )
+                        product = next((p for p in self.products if p['id'] == item['product_id']), None)
+                        name = product['name'] if product else f"#{item['product_id']}"
+                        QMessageBox.warning(self, "موجودی ناکافی",
+                            f"⚠️ موجودی '{name}' کافی نیست!\n"
+                            f"موجودی: {available:,.2f} | درخواست: {item['quantity']:,.2f}")
                         return
         
-        # ذخیره
         try:
             with get_db() as conn:
                 c = conn.cursor()
                 
                 party_id = self.party_combo.currentData()
                 shamsi_date = self.date.get_shamsi()
-                doc_type = 'sales' if self.doc_type == 'sales' else 'purchase'
                 
                 if self._editing:
                     # برگرداندن موجودی قبلی
-                    c.execute("""
-                        SELECT product_id, quantity 
-                        FROM document_items 
-                        WHERE document_id = ?
-                    """, [self.doc_id])
-                    old_items = c.fetchall()
-                    
-                    for old_item in old_items:
-                        old_pid = old_item['product_id'] if hasattr(old_item, 'keys') else old_item[0]
-                        old_qty = old_item['quantity'] if hasattr(old_item, 'keys') else old_item[1]
+                    c.execute("SELECT product_id, quantity FROM document_items WHERE document_id = ?",
+                             [self.doc_id])
+                    for old in c.fetchall():
+                        old_dict = row_to_dict(old)
+                        old_pid = old_dict.get('product_id')
+                        old_qty = old_dict.get('quantity', 0)
                         
-                        update_inventory(c, old_pid, old_qty, doc_type, reverse=True)
+                        if is_sales_type(self.doc_type):
+                            c.execute("UPDATE products SET stock = stock + ? WHERE id = ?",
+                                     [old_qty, old_pid])
+                        else:
+                            c.execute("UPDATE products SET stock = stock - ? WHERE id = ?",
+                                     [old_qty, old_pid])
                     
                     c.execute('DELETE FROM document_items WHERE document_id = ?', [self.doc_id])
                     
@@ -1970,55 +2036,91 @@ class DocumentDialog(BaseDialog):
                             discount = ?, tax = ?, net_amount = ?,
                             updated_at = CURRENT_TIMESTAMP
                         WHERE id = ?
-                    """, [
-                        shamsi_date, party_id, self._total_amount,
-                        self._discount, self._tax, self._net_amount,
-                        self.doc_id
-                    ])
+                    """, [shamsi_date, party_id, self._total_amount,
+                          self._discount, self._tax, self._net_amount, self.doc_id])
                     
                     doc_id = self.doc_id
-                
                 else:
-                    # ✅ کوئری امن با پارامتر
-                    prefix = "SAL" if doc_type == 'sales' else "PUR"
-                    c.execute("""
-                        SELECT MAX(CAST(SUBSTR(doc_no, 4) AS INTEGER)) 
-                        FROM documents 
-                        WHERE doc_no LIKE ?
-                    """, [f"{prefix}%"])
-                    max_no_row = c.fetchone()
-                    max_no = max_no_row[0] if max_no_row else 0
-                    doc_no = f"{prefix}{(max_no + 1) if max_no else 1:06d}"
+                    prefix = get_doc_type_prefix(self.doc_type)
+                    c.execute(f"""
+                        SELECT MAX(CAST(SUBSTR(doc_no, 4) AS INTEGER))
+                        FROM documents WHERE doc_no LIKE '{prefix}%'
+                    """)
+                    max_no = c.fetchone()[0] or 0
+                    doc_no = f"{prefix}{(max_no + 1):06d}"
                     
                     c.execute("""
                         INSERT INTO documents 
                         (doc_no, doc_type, date, party_id, total_amount, 
                          discount, tax, net_amount)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """, [
-                        doc_no, doc_type, shamsi_date, party_id,
-                        self._total_amount, self._discount,
-                        self._tax, self._net_amount
-                    ])
+                    """, [doc_no, self.doc_type, shamsi_date, party_id,
+                          self._total_amount, self._discount,
+                          self._tax, self._net_amount])
+                    
                     doc_id = c.lastrowid
                 
-                # ذخیره اقلام + به‌روزرسانی موجودی
+                # درج اقلام + بروزرسانی انبار
                 for item in items:
                     c.execute("""
                         INSERT INTO document_items 
                         (document_id, product_id, quantity, unit_price, total_price)
                         VALUES (?, ?, ?, ?, ?)
-                    """, [
-                        doc_id, item['product_id'], item['quantity'],
-                        item['unit_price'], item['total_price']
-                    ])
+                    """, [doc_id, item['product_id'], item['quantity'],
+                          item['unit_price'], item['total_price']])
                     
-                    update_inventory(c, item['product_id'], item['quantity'], doc_type)
+                    if is_sales_type(self.doc_type):
+                        c.execute("UPDATE products SET stock = stock - ? WHERE id = ?",
+                                 [item['quantity'], item['product_id']])
+                        c.execute("""
+                            UPDATE warehouse_stock 
+                            SET quantity = quantity - ?
+                            WHERE product_id = ?
+                        """, [item['quantity'], item['product_id']])
+                    else:
+                        c.execute("UPDATE products SET stock = stock + ? WHERE id = ?",
+                                 [item['quantity'], item['product_id']])
+                        c.execute("""
+                            UPDATE warehouse_stock 
+                            SET quantity = quantity + ?
+                            WHERE product_id = ?
+                        """, [item['quantity'], item['product_id']])
                 
                 conn.commit()
             
             super().accept()
-        
         except Exception as e:
-            logger.error(f"خطا در ذخیره سند: {e}", exc_info=True)
-            QMessageBox.warning(self, "خطا", f"❌ خطا در ذخیره سند: {str(e)}")
+            logger.error(f"خطا در ذخیره: {e}", exc_info=True)
+            QMessageBox.warning(self, "خطا", f"❌ {str(e)}")
+    
+    def apply_theme(self):
+        self.setStyleSheet("""
+            QDialog { background: #f5f6fa; }
+            QGroupBox {
+                background: white; color: #1a1a2e;
+                border: 1px solid #dcdde1; border-radius: 6px;
+                margin-top: 12px; padding: 10px;
+                font-weight: bold;
+            }
+            QGroupBox::title {
+                color: #1976D2; padding: 0 8px;
+                subcontrol-origin: margin; left: 10px;
+            }
+            QTableWidget {
+                background: white; color: #1a1a2e;
+                border: 1px solid #dcdde1; border-radius: 6px;
+                gridline-color: #dcdde1;
+            }
+            QHeaderView::section {
+                background: #e8e8e8; color: #1a1a2e;
+                padding: 8px; border: none; font-weight: bold;
+            }
+            QLineEdit, QComboBox, QTextEdit, QDoubleSpinBox {
+                background: white; color: #1a1a2e;
+                border: 1px solid #dcdde1; border-radius: 6px;
+                padding: 6px 10px; min-height: 28px;
+            }
+            QLineEdit:focus, QComboBox:focus, QDoubleSpinBox:focus {
+                border: 2px solid #1976D2;
+            }
+        """)

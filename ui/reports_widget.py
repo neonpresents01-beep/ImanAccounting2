@@ -1,6 +1,6 @@
 # ui/reports_widget.py
 # ============================================================
-# ویجت گزارشات جامع حسابداری — نسخه 2.0 (Theme-Integrated)
+# ویجت گزارشات جامع حسابداری — نسخه 3.0 (با چاپ و PDF)
 # ============================================================
 
 from PyQt5.QtWidgets import *
@@ -10,24 +10,63 @@ from datetime import datetime, timedelta
 from database import get_db, AccountingHelper
 from shamsi_date import ShamsiDateEdit, safe_display_date, get_today_jalali
 from ui.base_widgets import BaseWidget
+from ui.accounting_pdf import AccountingPDFGenerator, get_pdf_generator
 import csv
 import logging
 
 logger = logging.getLogger(__name__)
 
 
+# ═══════════════════════════════════════════════════════════
+# تابع کمکی — دریافت اطلاعات شرکت
+# ═══════════════════════════════════════════════════════════
+
+def _get_company_info() -> dict:
+    """دریافت اطلاعات شرکت از دیتابیس"""
+    try:
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute("SELECT key, value FROM settings WHERE key LIKE 'company_%'")
+            rows = c.fetchall()
+            info = {}
+            for row in rows:
+                info[row['key']] = row['value']
+            
+            if not info or not info.get('company_name'):
+                info = {
+                    'company_name': 'شرکت حسابداری پارسه',
+                    'company_economic': '',
+                    'company_phone': '',
+                    'company_address': '',
+                }
+            return info
+    except Exception as e:
+        logger.warning(f"خطا: {e}")
+        return {
+            'company_name': 'شرکت حسابداری پارسه',
+            'company_economic': '',
+            'company_phone': '',
+            'company_address': '',
+        }
+
+
 class ReportsWidget(BaseWidget):
-    """ویجت گزارشات جامع — نسخه یکپارچه با تم"""
+    """ویجت گزارشات جامع — نسخه یکپارچه با تم + چاپ و PDF"""
     
     def __init__(self, parent=None, user_level: str = 'viewer'):
         super().__init__(parent)
         self._user_level = user_level
+        
+        # PDF Generator
+        self.company_info = _get_company_info()
+        self.pdf_generator = get_pdf_generator(self.company_info)
+        
         self.init_ui()
         self.refresh_all_reports()
         self._apply_widget_theme()
     
     # ============================================================
-    # Theme — کامل و یکپارچه (مثل settings_widget)
+    # Theme — کامل و یکپارچه
     # ============================================================
     
     def _apply_widget_theme(self):
@@ -35,7 +74,6 @@ class ReportsWidget(BaseWidget):
         try:
             c = self.get_theme_colors()
             
-            # 1. خود ویجت
             self.setStyleSheet(f"""
                 QWidget {{
                     background: {c['bg']};
@@ -43,7 +81,6 @@ class ReportsWidget(BaseWidget):
                 }}
             """)
             
-            # 2. TabWidget
             if hasattr(self, 'tab_widget'):
                 self.tab_widget.setStyleSheet(f"""
                     QTabWidget::pane {{
@@ -69,7 +106,6 @@ class ReportsWidget(BaseWidget):
                     }}
                 """)
             
-            # 3. QGroupBoxها
             for gb in self.findChildren(QGroupBox):
                 gb.setStyleSheet(f"""
                     QGroupBox {{
@@ -92,7 +128,6 @@ class ReportsWidget(BaseWidget):
                     }}
                 """)
             
-            # 4. ScrollArea
             for sa in self.findChildren(QScrollArea):
                 sa.setStyleSheet(f"""
                     QScrollArea {{
@@ -112,19 +147,8 @@ class ReportsWidget(BaseWidget):
                     QScrollBar::handle:vertical:hover {{
                         background: {c['selected']};
                     }}
-                    QScrollBar:horizontal {{
-                        background: {c['bg_alt']};
-                        height: 10px;
-                        border-radius: 5px;
-                    }}
-                    QScrollBar::handle:horizontal {{
-                        background: {c['border']};
-                        border-radius: 5px;
-                        min-width: 20px;
-                    }}
                 """)
             
-            # 5. QTableWidget — استایل کامل و یکپارچه
             for tbl in self.findChildren(QTableWidget):
                 tbl.setStyleSheet(f"""
                     QTableWidget {{
@@ -163,7 +187,6 @@ class ReportsWidget(BaseWidget):
                     }}
                 """)
             
-            # 6. QTextEditها
             for te in self.findChildren(QTextEdit):
                 te.setStyleSheet(f"""
                     QTextEdit {{
@@ -175,7 +198,6 @@ class ReportsWidget(BaseWidget):
                     }}
                 """)
             
-            # 7. QLineEditها
             for le in self.findChildren(QLineEdit):
                 le.setStyleSheet(f"""
                     QLineEdit {{
@@ -191,7 +213,6 @@ class ReportsWidget(BaseWidget):
                     }}
                 """)
             
-            # 8. QComboBoxها
             for cb in self.findChildren(QComboBox):
                 cb.setStyleSheet(f"""
                     QComboBox {{
@@ -218,7 +239,6 @@ class ReportsWidget(BaseWidget):
                     }}
                 """)
             
-            # 9. QSpinBox و QDoubleSpinBox
             for sb in self.findChildren((QSpinBox, QDoubleSpinBox)):
                 sb.setStyleSheet(f"""
                     QSpinBox, QDoubleSpinBox {{
@@ -234,7 +254,6 @@ class ReportsWidget(BaseWidget):
                     }}
                 """)
             
-            # 10. QPushButtonها — با objectName خاص
             button_styles = {
                 'successBtn': (c['success'], '#ffffff'),
                 'warningBtn': (c['warning'], '#000000'),
@@ -270,7 +289,6 @@ class ReportsWidget(BaseWidget):
                         }}
                     """)
                 else:
-                    # دکمه‌های عادی
                     btn.setStyleSheet(f"""
                         QPushButton {{
                             background: {c['bg_alt']};
@@ -295,7 +313,6 @@ class ReportsWidget(BaseWidget):
                         }}
                     """)
             
-            # 11. QLabelهای عمومی (فقط متن‌ها، نه عنوان‌ها)
             for lbl in self.findChildren(QLabel):
                 obj_name = lbl.objectName()
                 
@@ -309,7 +326,6 @@ class ReportsWidget(BaseWidget):
                     """)
                 elif not lbl.styleSheet() or 'background' not in lbl.styleSheet():
                     text = lbl.text() or ""
-                    # فقط لیبل‌های معمولی (نه اموجی‌های عنوان)
                     if not any(text.startswith(p) for p in [
                         '🏢', '🖼️', '🌍', '📋', '📊', '💰', '🤖',
                         '💾', '🔧', '📅', '⚙️', '📝', '💡', '✏️',
@@ -320,7 +336,6 @@ class ReportsWidget(BaseWidget):
                             f"color: {c['text']}; background: transparent; padding: 3px;"
                         )
             
-            # 12. StatusBar
             if hasattr(self, 'statusBar'):
                 self.statusBar.setStyleSheet(f"""
                     QStatusBar {{
@@ -331,7 +346,6 @@ class ReportsWidget(BaseWidget):
                     }}
                 """)
             
-            # 13. لیبل‌های جمع‌بندی (total_label)
             for attr in ['trial_total_label', 'adj_trial_total_label',
                          'opening_total_label', 'customers_total_label',
                          'inv_total_label', 'payroll_total_label']:
@@ -345,7 +359,6 @@ class ReportsWidget(BaseWidget):
                         font-weight: bold;
                     """)
             
-            # 14. لیبل‌های اطلاعاتی خاص
             for attr in ['closing_info', 'closing_result']:
                 if hasattr(self, attr):
                     getattr(self, attr).setStyleSheet(f"""
@@ -357,7 +370,6 @@ class ReportsWidget(BaseWidget):
                         font-family: Tahoma;
                     """)
             
-            # 15. QTextEditهای گزارش متنی
             for attr in ['profit_loss_text', 'capital_text', 'bs_text',
                          'cash_flow_text', 'ratios_text']:
                 if hasattr(self, attr):
@@ -373,7 +385,6 @@ class ReportsWidget(BaseWidget):
                         }}
                     """)
             
-            # 16. فرم‌های QFormLayout — layout labels
             for form in self.findChildren(QFormLayout):
                 for i in range(form.rowCount()):
                     label_item = form.itemAt(i, QFormLayout.LabelRole)
@@ -406,12 +417,10 @@ class ReportsWidget(BaseWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
         
-        # Title
         title = QLabel("📊 گزارشات جامع حسابداری")
         title.setObjectName("titleLabel")
         layout.addWidget(title)
         
-        # Tabs
         self.tab_widget = QTabWidget()
         self.tab_widget.setObjectName("reportsTabs")
         
@@ -434,7 +443,6 @@ class ReportsWidget(BaseWidget):
         
         layout.addWidget(self.tab_widget)
         
-        # StatusBar
         self.statusBar = QStatusBar()
         self.statusBar.setObjectName("reportsStatusBar")
         layout.addWidget(self.statusBar)
@@ -470,6 +478,229 @@ class ReportsWidget(BaseWidget):
         btn.clicked.connect(callback)
         return btn
     
+    def _make_print_button(self, callback):
+        """دکمه چاپ"""
+        btn = QPushButton("🖨️ چاپ")
+        btn.setObjectName("infoBtn")
+        btn.clicked.connect(callback)
+        btn.setToolTip("چاپ گزارش")
+        return btn
+    
+    def _make_pdf_button(self, callback):
+        """دکمه خروجی PDF"""
+        btn = QPushButton("📄 PDF")
+        btn.setObjectName("successBtn")
+        btn.clicked.connect(callback)
+        btn.setToolTip("ذخیره PDF گزارش")
+        return btn
+    
+    # ============================================================
+    # Helper: خروجی PDF از جدول
+    # ============================================================
+    
+    def _export_table_to_pdf(self, table, title, subtitle="", filename_prefix="report"):
+        """خروجی PDF از یک QTableWidget"""
+        if table.rowCount() == 0:
+            QMessageBox.warning(self, "خطا", "داده‌ای برای خروجی وجود ندارد!")
+            return
+        
+        default_name = f"{filename_prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+        file_path = AccountingPDFGenerator.ask_save_path(self, default_name)
+        
+        if not file_path:
+            return
+        
+        try:
+            # استخراج هدرها
+            headers = []
+            for col in range(table.columnCount()):
+                header = table.horizontalHeaderItem(col)
+                headers.append(header.text() if header else "")
+            
+            # استخراج ردیف‌ها
+            rows = []
+            for row in range(table.rowCount()):
+                row_data = []
+                for col in range(table.columnCount()):
+                    item = table.item(row, col)
+                    row_data.append(item.text() if item else "")
+                rows.append(row_data)
+            
+            # استخراج جمع‌ها (اگر لیبل total دارد)
+            totals = None
+            
+            # ساخت HTML
+            html = self.pdf_generator.generate_table_html(
+                title, subtitle, headers, rows, totals
+            )
+            
+            # ذخیره PDF
+            success = self._save_html_as_pdf(html, file_path)
+            
+            if success:
+                QMessageBox.information(
+                    self, "موفق",
+                    f"✅ PDF گزارش ذخیره شد:\n{file_path}"
+                )
+            else:
+                QMessageBox.warning(self, "خطا", "❌ خطا در تولید PDF!")
+        
+        except Exception as e:
+            logger.error(f"خطا در PDF: {e}", exc_info=True)
+            QMessageBox.warning(self, "خطا", f"❌ {str(e)}")
+    
+    def _save_html_as_pdf(self, html_content: str, file_path: str) -> bool:
+        """ذخیره HTML به PDF با ReportLab"""
+        try:
+            from reportlab.lib.pagesizes import A4
+            from reportlab.platypus import SimpleDocTemplate
+            from reportlab.lib.units import mm
+            
+            # اینجا از QPrinter استفاده می‌کنیم که خودش HTML → PDF می‌کنه
+            # ولی برای PDF مستقیم، از ReportLab استفاده می‌کنیم
+            
+            # ساده‌ترین راه: استفاده از QPrinter
+            from PyQt5.QtPrintSupport import QPrinter
+            from PyQt5.QtGui import QTextDocument
+            
+            printer = QPrinter(QPrinter.ScreenResolution)
+            printer.setOutputFormat(QPrinter.PdfFormat)
+            printer.setOutputFileName(file_path)
+            printer.setPageSize(QPrinter.A4)
+            printer.setPageMargins(10, 10, 10, 10, QPrinter.Millimeter)
+            
+            doc = QTextDocument()
+            doc.setHtml(html_content)
+            
+            from PyQt5.QtCore import QSizeF
+            rect = printer.pageRect(QPrinter.DevicePixel)
+            doc.setPageSize(QSizeF(rect.width(), rect.height()))
+            
+            doc.print_(printer)
+            return True
+        except Exception as e:
+            logger.error(f"خطا در save_html_as_pdf: {e}", exc_info=True)
+            return False
+    
+    def _print_table(self, table, title, subtitle=""):
+        """چاپ جدول"""
+        if table.rowCount() == 0:
+            QMessageBox.warning(self, "خطا", "داده‌ای برای چاپ وجود ندارد!")
+            return
+        
+        try:
+            headers = []
+            for col in range(table.columnCount()):
+                header = table.horizontalHeaderItem(col)
+                headers.append(header.text() if header else "")
+            
+            rows = []
+            for row in range(table.rowCount()):
+                row_data = []
+                for col in range(table.columnCount()):
+                    item = table.item(row, col)
+                    row_data.append(item.text() if item else "")
+                rows.append(row_data)
+            
+            html = self.pdf_generator.generate_table_html(
+                title, subtitle, headers, rows
+            )
+            
+            AccountingPDFGenerator.print_html(html, self)
+        except Exception as e:
+            logger.error(f"خطا در چاپ: {e}", exc_info=True)
+            QMessageBox.warning(self, "خطا", f"❌ خطا در چاپ: {str(e)}")
+    
+    def _print_html_text(self, text_edit, title, subtitle=""):
+        """چاپ محتوای QTextEdit"""
+        if not text_edit.toPlainText().strip():
+            QMessageBox.warning(self, "خطا", "داده‌ای برای چاپ وجود ندارد!")
+            return
+        
+        try:
+            content = text_edit.toHtml()
+            
+            html = f"""
+            <html>
+            <head>
+            <meta charset="UTF-8">
+            <style>
+                body {{
+                    font-family: Tahoma, sans-serif;
+                    direction: rtl;
+                    padding: 15px;
+                    color: #2c3e50;
+                    font-size: 11pt;
+                }}
+                table {{ width: 100%; border-collapse: collapse; margin: 10px 0; }}
+                th {{ background-color: #273c75; color: white; padding: 8px; text-align: center; }}
+                td {{ border: 1px solid #ddd; padding: 7px; }}
+                h2, h3 {{ color: #273c75; }}
+            </style>
+            </head>
+            <body>
+                {content}
+            </body>
+            </html>
+            """
+            
+            AccountingPDFGenerator.print_html(html, self)
+        except Exception as e:
+            logger.error(f"خطا در چاپ متن: {e}", exc_info=True)
+            QMessageBox.warning(self, "خطا", f"❌ خطا در چاپ: {str(e)}")
+    
+    def _export_html_text_to_pdf(self, text_edit, title, filename_prefix="report"):
+        """ذخیره محتوای QTextEdit به PDF"""
+        if not text_edit.toPlainText().strip():
+            QMessageBox.warning(self, "خطا", "داده‌ای برای خروجی وجود ندارد!")
+            return
+        
+        default_name = f"{filename_prefix}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+        file_path = AccountingPDFGenerator.ask_save_path(self, default_name)
+        
+        if not file_path:
+            return
+        
+        try:
+            content = text_edit.toHtml()
+            
+            html = f"""
+            <html>
+            <head>
+            <meta charset="UTF-8">
+            <style>
+                body {{
+                    font-family: Tahoma, sans-serif;
+                    direction: rtl;
+                    padding: 15px;
+                    color: #2c3e50;
+                    font-size: 11pt;
+                }}
+                table {{ width: 100%; border-collapse: collapse; margin: 10px 0; }}
+                th {{ background-color: #273c75; color: white; padding: 8px; text-align: center; }}
+                td {{ border: 1px solid #ddd; padding: 7px; }}
+                h2, h3 {{ color: #273c75; }}
+            </style>
+            </head>
+            <body>
+                {content}
+            </body>
+            </html>
+            """
+            
+            success = self._save_html_as_pdf(html, file_path)
+            
+            if success:
+                QMessageBox.information(
+                    self, "موفق",
+                    f"✅ PDF گزارش ذخیره شد:\n{file_path}"
+                )
+            else:
+                QMessageBox.warning(self, "خطا", "❌ خطا در تولید PDF!")
+        except Exception as e:
+            logger.error(f"خطا در PDF: {e}", exc_info=True)
+            QMessageBox.warning(self, "خطا", f"❌ {str(e)}")
+    
     # ============================================================
     # تراز آزمایشی
     # ============================================================
@@ -478,18 +709,26 @@ class ReportsWidget(BaseWidget):
         widget = QWidget()
         layout = QVBoxLayout(widget)
         
+        # ───── ردیف اول: فیلترها ─────
         control_layout = QHBoxLayout()
         control_layout.addWidget(QLabel("تاریخ:"))
         self.trial_date = ShamsiDateEdit()
         control_layout.addWidget(self.trial_date)
         
         control_layout.addWidget(self._make_show_button(self.show_trial_balance))
-        control_layout.addWidget(self._make_export_button(
-            lambda: self.export_table_to_excel(self.trial_table, "تراز_آزمایشی")
-        ))
-        
         control_layout.addStretch()
         layout.addLayout(control_layout)
+        
+        # ───── ردیف دوم: خروجی‌ها ─────
+        export_layout = QHBoxLayout()
+        export_layout.addWidget(QLabel("📌 خروجی:"))
+        export_layout.addWidget(self._make_print_button(self.print_trial_balance))
+        export_layout.addWidget(self._make_pdf_button(self.save_trial_balance_pdf))
+        export_layout.addWidget(self._make_export_button(
+            lambda: self.export_table_to_excel(self.trial_table, "تراز_آزمایشی")
+        ))
+        export_layout.addStretch()
+        layout.addLayout(export_layout)
         
         self.trial_table = QTableWidget()
         self.trial_table.setColumnCount(6)
@@ -526,6 +765,23 @@ class ReportsWidget(BaseWidget):
         
         self._display_trial_balance(
             self.trial_table, self.trial_total_label, data, shamsi_date
+        )
+    
+    def print_trial_balance(self):
+        """چاپ تراز آزمایشی"""
+        self._print_table(
+            self.trial_table,
+            "تراز آزمایشی",
+            f"تاریخ: {self.trial_date.get_shamsi()}"
+        )
+    
+    def save_trial_balance_pdf(self):
+        """ذخیره PDF تراز آزمایشی"""
+        self._export_table_to_pdf(
+            self.trial_table,
+            "تراز آزمایشی",
+            f"تاریخ: {self.trial_date.get_shamsi()}",
+            "تراز_آزمایشی"
         )
     
     def _display_trial_balance(self, table, label, data, date_str=""):
@@ -788,22 +1044,29 @@ class ReportsWidget(BaseWidget):
         widget = QWidget()
         layout = QVBoxLayout(widget)
         
+        # ───── ردیف اول ─────
         control_layout = QHBoxLayout()
         control_layout.addWidget(QLabel("تاریخ:"))
         self.adj_trial_date = ShamsiDateEdit()
         control_layout.addWidget(self.adj_trial_date)
-        
         control_layout.addWidget(
             self._make_show_button(self.show_adjusted_trial_balance)
         )
-        control_layout.addWidget(self._make_export_button(
+        control_layout.addStretch()
+        layout.addLayout(control_layout)
+        
+        # ───── ردیف دوم ─────
+        export_layout = QHBoxLayout()
+        export_layout.addWidget(QLabel("📌 خروجی:"))
+        export_layout.addWidget(self._make_print_button(self.print_adjusted_trial))
+        export_layout.addWidget(self._make_pdf_button(self.save_adjusted_trial_pdf))
+        export_layout.addWidget(self._make_export_button(
             lambda: self.export_table_to_excel(
                 self.adj_trial_table, "تراز_آزمایشی_اصلاح_شده"
             )
         ))
-        
-        control_layout.addStretch()
-        layout.addLayout(control_layout)
+        export_layout.addStretch()
+        layout.addLayout(export_layout)
         
         self.adj_trial_table = QTableWidget()
         self.adj_trial_table.setColumnCount(6)
@@ -842,6 +1105,21 @@ class ReportsWidget(BaseWidget):
             self.adj_trial_table, self.adj_trial_total_label, data, shamsi_date
         )
     
+    def print_adjusted_trial(self):
+        self._print_table(
+            self.adj_trial_table,
+            "تراز آزمایشی (بعد از اصلاح)",
+            f"تاریخ: {self.adj_trial_date.get_shamsi()}"
+        )
+    
+    def save_adjusted_trial_pdf(self):
+        self._export_table_to_pdf(
+            self.adj_trial_table,
+            "تراز آزمایشی (بعد از اصلاح)",
+            f"تاریخ: {self.adj_trial_date.get_shamsi()}",
+            "تراز_اصلاح_شده"
+        )
+    
     # ============================================================
     # صورت سود و زیان
     # ============================================================
@@ -850,6 +1128,7 @@ class ReportsWidget(BaseWidget):
         widget = QWidget()
         layout = QVBoxLayout(widget)
         
+        # ───── ردیف اول ─────
         control_layout = QHBoxLayout()
         control_layout.addWidget(QLabel("از تاریخ:"))
         self.pl_from_date = ShamsiDateEdit()
@@ -860,18 +1139,39 @@ class ReportsWidget(BaseWidget):
         control_layout.addWidget(self.pl_to_date)
         
         control_layout.addWidget(self._make_show_button(self.show_profit_loss))
-        control_layout.addWidget(self._make_export_button(
-            self.export_profit_loss_to_excel
-        ))
-        
         control_layout.addStretch()
         layout.addLayout(control_layout)
+        
+        # ───── ردیف دوم ─────
+        export_layout = QHBoxLayout()
+        export_layout.addWidget(QLabel("📌 خروجی:"))
+        export_layout.addWidget(self._make_print_button(self.print_profit_loss))
+        export_layout.addWidget(self._make_pdf_button(self.save_profit_loss_pdf))
+        export_layout.addWidget(self._make_export_button(
+            self.export_profit_loss_to_excel
+        ))
+        export_layout.addStretch()
+        layout.addLayout(export_layout)
         
         self.profit_loss_text = QTextEdit()
         self.profit_loss_text.setReadOnly(True)
         layout.addWidget(self.profit_loss_text)
         
         return widget
+    
+    def print_profit_loss(self):
+        self._print_html_text(
+            self.profit_loss_text,
+            "صورت سود و زیان",
+            f"از {self.pl_from_date.get_shamsi()} تا {self.pl_to_date.get_shamsi()}"
+        )
+    
+    def save_profit_loss_pdf(self):
+        self._export_html_text_to_pdf(
+            self.profit_loss_text,
+            "صورت سود و زیان",
+            "سود_زیان"
+        )
     
     def show_profit_loss(self):
         from_date_shamsi = self.pl_from_date.get_shamsi()
@@ -953,18 +1253,37 @@ class ReportsWidget(BaseWidget):
         control_layout.addWidget(QLabel("تاریخ:"))
         self.capital_date = ShamsiDateEdit()
         control_layout.addWidget(self.capital_date)
-        
         control_layout.addWidget(self._make_show_button(self.show_capital_statement))
-        control_layout.addWidget(self._make_export_button(self.export_capital_to_excel))
-        
         control_layout.addStretch()
         layout.addLayout(control_layout)
+        
+        export_layout = QHBoxLayout()
+        export_layout.addWidget(QLabel("📌 خروجی:"))
+        export_layout.addWidget(self._make_print_button(self.print_capital))
+        export_layout.addWidget(self._make_pdf_button(self.save_capital_pdf))
+        export_layout.addWidget(self._make_export_button(self.export_capital_to_excel))
+        export_layout.addStretch()
+        layout.addLayout(export_layout)
         
         self.capital_text = QTextEdit()
         self.capital_text.setReadOnly(True)
         layout.addWidget(self.capital_text)
         
         return widget
+    
+    def print_capital(self):
+        self._print_html_text(
+            self.capital_text,
+            "صورت تغییرات سرمایه",
+            f"تاریخ: {self.capital_date.get_shamsi()}"
+        )
+    
+    def save_capital_pdf(self):
+        self._export_html_text_to_pdf(
+            self.capital_text,
+            "صورت تغییرات سرمایه",
+            "صورت_سرمایه"
+        )
     
     def show_capital_statement(self):
         shamsi_date = self.capital_date.get_shamsi()
@@ -1041,20 +1360,39 @@ class ReportsWidget(BaseWidget):
         control_layout.addWidget(QLabel("تاریخ:"))
         self.bs_date = ShamsiDateEdit()
         control_layout.addWidget(self.bs_date)
-        
         control_layout.addWidget(self._make_show_button(self.show_balance_sheet))
-        control_layout.addWidget(self._make_export_button(
-            self.export_balance_sheet_to_excel
-        ))
-        
         control_layout.addStretch()
         layout.addLayout(control_layout)
+        
+        export_layout = QHBoxLayout()
+        export_layout.addWidget(QLabel("📌 خروجی:"))
+        export_layout.addWidget(self._make_print_button(self.print_balance_sheet))
+        export_layout.addWidget(self._make_pdf_button(self.save_balance_sheet_pdf))
+        export_layout.addWidget(self._make_export_button(
+            self.export_balance_sheet_to_excel
+        ))
+        export_layout.addStretch()
+        layout.addLayout(export_layout)
         
         self.bs_text = QTextEdit()
         self.bs_text.setReadOnly(True)
         layout.addWidget(self.bs_text)
         
         return widget
+    
+    def print_balance_sheet(self):
+        self._print_html_text(
+            self.bs_text,
+            "ترازنامه",
+            f"تاریخ: {self.bs_date.get_shamsi()}"
+        )
+    
+    def save_balance_sheet_pdf(self):
+        self._export_html_text_to_pdf(
+            self.bs_text,
+            "ترازنامه",
+            "ترازنامه"
+        )
     
     def show_balance_sheet(self):
         shamsi_date = self.bs_date.get_shamsi()
@@ -1352,6 +1690,13 @@ class ReportsWidget(BaseWidget):
         control_layout.addStretch()
         layout.addLayout(control_layout)
         
+        export_layout = QHBoxLayout()
+        export_layout.addWidget(QLabel("📌 خروجی:"))
+        export_layout.addWidget(self._make_print_button(self.print_opening_trial))
+        export_layout.addWidget(self._make_pdf_button(self.save_opening_trial_pdf))
+        export_layout.addStretch()
+        layout.addLayout(export_layout)
+        
         self.opening_table = QTableWidget()
         self.opening_table.setColumnCount(4)
         self.opening_table.setHorizontalHeaderLabels(
@@ -1365,6 +1710,21 @@ class ReportsWidget(BaseWidget):
         layout.addWidget(self.opening_total_label)
         
         return widget
+    
+    def print_opening_trial(self):
+        self._print_table(
+            self.opening_table,
+            "تراز افتتاحیه",
+            f"تاریخ: {self.opening_date.get_shamsi()}"
+        )
+    
+    def save_opening_trial_pdf(self):
+        self._export_table_to_pdf(
+            self.opening_table,
+            "تراز افتتاحیه",
+            f"تاریخ: {self.opening_date.get_shamsi()}",
+            "تراز_افتتاحیه"
+        )
     
     def show_opening_trial_balance(self):
         display_date = self.opening_date.get_shamsi()
@@ -1431,16 +1791,36 @@ class ReportsWidget(BaseWidget):
         control_layout.addWidget(self.cf_to_date)
         
         control_layout.addWidget(self._make_show_button(self.show_cash_flow))
-        control_layout.addWidget(self._make_export_button(self.export_cash_flow))
-        
         control_layout.addStretch()
         layout.addLayout(control_layout)
+        
+        export_layout = QHBoxLayout()
+        export_layout.addWidget(QLabel("📌 خروجی:"))
+        export_layout.addWidget(self._make_print_button(self.print_cash_flow))
+        export_layout.addWidget(self._make_pdf_button(self.save_cash_flow_pdf))
+        export_layout.addWidget(self._make_export_button(self.export_cash_flow))
+        export_layout.addStretch()
+        layout.addLayout(export_layout)
         
         self.cash_flow_text = QTextEdit()
         self.cash_flow_text.setReadOnly(True)
         layout.addWidget(self.cash_flow_text)
         
         return widget
+    
+    def print_cash_flow(self):
+        self._print_html_text(
+            self.cash_flow_text,
+            "صورت جریان نقدی",
+            f"از {self.cf_from_date.get_shamsi()} تا {self.cf_to_date.get_shamsi()}"
+        )
+    
+    def save_cash_flow_pdf(self):
+        self._export_html_text_to_pdf(
+            self.cash_flow_text,
+            "صورت جریان نقدی",
+            "جریان_نقدی"
+        )
     
     def show_cash_flow(self):
         from_date = self._shamsi_to_gregorian(self.cf_from_date.get_shamsi())
@@ -1511,16 +1891,36 @@ class ReportsWidget(BaseWidget):
         control_layout.addWidget(QLabel("تاریخ:"))
         self.ratios_date = ShamsiDateEdit()
         control_layout.addWidget(self.ratios_date)
-        
         control_layout.addWidget(self._make_show_button(self.show_ratios))
         control_layout.addStretch()
         layout.addLayout(control_layout)
+        
+        export_layout = QHBoxLayout()
+        export_layout.addWidget(QLabel("📌 خروجی:"))
+        export_layout.addWidget(self._make_print_button(self.print_ratios))
+        export_layout.addWidget(self._make_pdf_button(self.save_ratios_pdf))
+        export_layout.addStretch()
+        layout.addLayout(export_layout)
         
         self.ratios_text = QTextEdit()
         self.ratios_text.setReadOnly(True)
         layout.addWidget(self.ratios_text)
         
         return widget
+    
+    def print_ratios(self):
+        self._print_html_text(
+            self.ratios_text,
+            "نسبت‌های مالی",
+            f"تاریخ: {self.ratios_date.get_shamsi()}"
+        )
+    
+    def save_ratios_pdf(self):
+        self._export_html_text_to_pdf(
+            self.ratios_text,
+            "نسبت‌های مالی",
+            "نسبت‌های_مالی"
+        )
     
     def show_ratios(self):
         display_date = self.ratios_date.get_shamsi()
@@ -1628,12 +2028,18 @@ class ReportsWidget(BaseWidget):
         control_layout.addWidget(
             self._make_show_button(self.show_customers_report)
         )
-        control_layout.addWidget(self._make_export_button(
-            lambda: self.export_table_to_excel(self.customers_table, "گزارش_مشتریان")
-        ))
-        
         control_layout.addStretch()
         layout.addLayout(control_layout)
+        
+        export_layout = QHBoxLayout()
+        export_layout.addWidget(QLabel("📌 خروجی:"))
+        export_layout.addWidget(self._make_print_button(self.print_customers))
+        export_layout.addWidget(self._make_pdf_button(self.save_customers_pdf))
+        export_layout.addWidget(self._make_export_button(
+            lambda: self.export_table_to_excel(self.customers_table, "گزارش_مشتریان")
+        ))
+        export_layout.addStretch()
+        layout.addLayout(export_layout)
         
         self.customers_table = QTableWidget()
         self.customers_table.setAlternatingRowColors(True)
@@ -1643,6 +2049,21 @@ class ReportsWidget(BaseWidget):
         layout.addWidget(self.customers_total_label)
         
         return widget
+    
+    def print_customers(self):
+        self._print_table(
+            self.customers_table,
+            "گزارش مشتریان",
+            self.customer_report_type.currentText()
+        )
+    
+    def save_customers_pdf(self):
+        self._export_table_to_pdf(
+            self.customers_table,
+            "گزارش مشتریان",
+            self.customer_report_type.currentText(),
+            "گزارش_مشتریان"
+        )
     
     def show_customers_report(self):
         report_type = self.customer_report_type.currentIndex()
@@ -1769,12 +2190,18 @@ class ReportsWidget(BaseWidget):
         control_layout.addWidget(
             self._make_show_button(self.show_inventory_report)
         )
-        control_layout.addWidget(self._make_export_button(
-            lambda: self.export_table_to_excel(self.inv_table, "گزارش_انبار")
-        ))
-        
         control_layout.addStretch()
         layout.addLayout(control_layout)
+        
+        export_layout = QHBoxLayout()
+        export_layout.addWidget(QLabel("📌 خروجی:"))
+        export_layout.addWidget(self._make_print_button(self.print_inventory))
+        export_layout.addWidget(self._make_pdf_button(self.save_inventory_pdf))
+        export_layout.addWidget(self._make_export_button(
+            lambda: self.export_table_to_excel(self.inv_table, "گزارش_انبار")
+        ))
+        export_layout.addStretch()
+        layout.addLayout(export_layout)
         
         self.inv_table = QTableWidget()
         self.inv_table.setAlternatingRowColors(True)
@@ -1784,6 +2211,21 @@ class ReportsWidget(BaseWidget):
         layout.addWidget(self.inv_total_label)
         
         return widget
+    
+    def print_inventory(self):
+        self._print_table(
+            self.inv_table,
+            "گزارش انبار",
+            self.inv_report_type.currentText()
+        )
+    
+    def save_inventory_pdf(self):
+        self._export_table_to_pdf(
+            self.inv_table,
+            "گزارش انبار",
+            self.inv_report_type.currentText(),
+            "گزارش_انبار"
+        )
     
     def show_inventory_report(self):
         report_type = self.inv_report_type.currentIndex()
@@ -1969,12 +2411,18 @@ class ReportsWidget(BaseWidget):
         control_layout.addWidget(
             self._make_show_button(self.show_payroll_report)
         )
-        control_layout.addWidget(self._make_export_button(
-            lambda: self.export_table_to_excel(self.payroll_table, "گزارش_حقوق")
-        ))
-        
         control_layout.addStretch()
         layout.addLayout(control_layout)
+        
+        export_layout = QHBoxLayout()
+        export_layout.addWidget(QLabel("📌 خروجی:"))
+        export_layout.addWidget(self._make_print_button(self.print_payroll))
+        export_layout.addWidget(self._make_pdf_button(self.save_payroll_pdf))
+        export_layout.addWidget(self._make_export_button(
+            lambda: self.export_table_to_excel(self.payroll_table, "گزارش_حقوق")
+        ))
+        export_layout.addStretch()
+        layout.addLayout(export_layout)
         
         self.payroll_table = QTableWidget()
         self.payroll_table.setAlternatingRowColors(True)
@@ -1984,6 +2432,21 @@ class ReportsWidget(BaseWidget):
         layout.addWidget(self.payroll_total_label)
         
         return widget
+    
+    def print_payroll(self):
+        self._print_table(
+            self.payroll_table,
+            "گزارش حقوق و دستمزد",
+            f"سال {self.payroll_year.value()} | {self.payroll_report_type.currentText()}"
+        )
+    
+    def save_payroll_pdf(self):
+        self._export_table_to_pdf(
+            self.payroll_table,
+            "گزارش حقوق و دستمزد",
+            f"سال {self.payroll_year.value()} | {self.payroll_report_type.currentText()}",
+            "گزارش_حقوق"
+        )
     
     def show_payroll_report(self):
         year = self.payroll_year.value()

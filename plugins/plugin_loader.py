@@ -1,15 +1,14 @@
 # plugins/plugin_loader.py
 # ============================================================
-# سیستم بارگذاری پلاگین ImanAccount - v4.0
+# سیستم بارگذاری پلاگین ImanAccount - v5.0
 # ============================================================
-# 
-# ویژگی‌ها:
-# ✅ بارگذاری پلاگین‌های رمزنگاری‌شده (.plugin)
-# ✅ رمزگشایی خودکار با کلید AES از لایسنس
-# ✅ بررسی امضای دیجیتال
-# ✅ بررسی ماژول‌های مجاز
-# ✅ سازگاری با پلاگین‌های قدیمی
-# ✅ پشتیبانی از فایل‌های .py
+# تغییرات v5.0:
+# ✅ پشتیبانی از group/order/widget_key در on_tab
+# ✅ آماده‌سازی برای MenuRegistry
+# ✅ پشتیبانی از before/after در ترتیب
+# ✅ اطلاعات کامل‌تر در get_plugin_tabs
+# ✅ API جدید: get_plugin_menu_structure
+# ✅ حفظ سازگاری کامل با v4.0
 # ============================================================
 
 import os
@@ -21,7 +20,7 @@ from pathlib import Path
 from typing import Dict, List, Any, Optional
 
 # ============================================================
-# Import از license_core (همه چیز در یک جا)
+# Import از license_core
 # ============================================================
 try:
     from license_core import (
@@ -48,6 +47,88 @@ class PluginEvent:
     ON_MENU = "on_menu"
     ON_ACTION = "on_action"
     ON_WIDGET = "on_widget"
+
+
+# ============================================================
+# ✅ NEW: ساختار استاندارد پلاگین در منو
+# ============================================================
+
+class PluginTabSpec:
+    """
+    مشخصات یه تب که پلاگین اضافه می‌کنه
+    
+    پلاگین می‌تونه این ساختار رو برگردونه:
+    
+    {
+        'title': 'صورتحساب مودیان',
+        'icon': '🏛️',
+        'widget': 'moadian_invoice',           # widget_id
+        
+        # ═══════════════════════════════════════════════════
+        # محل قرارگیری (اختیاری)
+        # ═══════════════════════════════════════════════════
+        
+        # 1. گروه هدف — اگه None باشه یعنی سطح بالا
+        'target_group': 'accounting',           # یا None
+        
+        # 2. ترتیب در گروه (پیش‌فرض 100)
+        'order': 100,
+        
+        # 3. ادغام در ویجت موجود (اختیاری)
+        #    اگه مشخص بشه، تب به عنوان یه Tab داخلی اضافه میشه
+        'widget_key': 'accounting',             # ویجت میزبان
+        'tab_index': 5,                          # ایندکس تب (اگه None = آخر)
+        
+        # 4. ماژول لایسنس (پیش‌فرض = plugin_id)
+        'module': 'accounting',
+        
+        # 5. متادیتا (اختیاری)
+        'metadata': {...},
+    }
+    """
+    
+    REQUIRED_KEYS = ('title',)
+    OPTIONAL_KEYS = (
+        'icon', 'widget', 'widget_id',
+        'target_group', 'order',
+        'widget_key', 'tab_index',
+        'module', 'metadata',
+        'before', 'after',
+    )
+    
+    @classmethod
+    def normalize(cls, tab: dict, plugin_id: str) -> Optional[dict]:
+        """نرمال‌سازی یه تب"""
+        if not isinstance(tab, dict):
+            return None
+        
+        # بررسی فیلد الزامی
+        if not tab.get('title'):
+            return None
+        
+        # Widget ID
+        widget_id = tab.get('widget') or tab.get('widget_id')
+        
+        # ساخت خروجی نرمال
+        normalized = {
+            'title': tab['title'],
+            'icon': tab.get('icon', '📄'),
+            'widget_id': widget_id,
+            'target_group': tab.get('target_group'),
+            'order': tab.get('order', 100),
+            'widget_key': tab.get('widget_key'),
+            'tab_index': tab.get('tab_index'),
+            'module': tab.get('module', plugin_id),
+            'metadata': tab.get('metadata', {}),
+            'before': tab.get('before'),
+            'after': tab.get('after'),
+            'plugin_id': plugin_id,
+            
+            # برای سازگاری با v4.0
+            'widget': widget_id,
+        }
+        
+        return normalized
 
 
 # ============================================================
@@ -104,8 +185,26 @@ class Plugin:
         return event in self.events
     
     def get_tabs(self) -> List[Dict]:
+        """
+        ✅ لیست تب‌ها با ساختار نرمال‌شده
+        
+        از v5.0: خروجی نرمال‌شده با تمام فیلدهای لازم
+        """
         result = self.fire(PluginEvent.ON_TAB)
-        return result if isinstance(result, list) else []
+        
+        if not isinstance(result, list):
+            return []
+        
+        # نرمال‌سازی هر تب
+        normalized_tabs = []
+        for tab in result:
+            normalized = PluginTabSpec.normalize(tab, self.id)
+            if normalized:
+                normalized_tabs.append(normalized)
+            else:
+                print(f"   ⚠️ تب نامعتبر در {self.id}: {tab}")
+        
+        return normalized_tabs
     
     def get_menus(self) -> List[Dict]:
         result = self.fire(PluginEvent.ON_MENU)
@@ -151,20 +250,13 @@ class PluginLoader:
         license_key: str = None,
         license_info: dict = None
     ):
-        """
-        Args:
-            plugin_dir: مسیر پوشه پلاگین‌ها
-            public_key: کلید عمومی ImanAI
-            license_key: کلید لایسنس مشتری
-            license_info: اطلاعات کامل لایسنس (ترجیحاً)
-        """
         self.plugin_dir = Path(plugin_dir)
         self.public_key_pem = public_key
         self.license_key = license_key
         self.license_info = license_info or {}
         self.plugins: Dict[str, Plugin] = {}
         
-        # ===== LicenseCore =====
+        # LicenseCore
         self.license_core = None
         if LICENSE_CORE_AVAILABLE:
             try:
@@ -172,14 +264,14 @@ class PluginLoader:
             except Exception as e:
                 print(f"⚠️ خطا در ایجاد LicenseCore: {e}")
         
-        # ===== PluginSigner =====
+        # PluginSigner
         self.signer = PluginSigner() if LICENSE_CORE_AVAILABLE else None
         
-        # ===== استخراج اطلاعات از لایسنس =====
+        # استخراج اطلاعات از لایسنس
         if self.license_key and not self.license_info:
             self._load_license_info()
         
-        # ===== ایجاد پوشه‌ها =====
+        # ایجاد پوشه‌ها
         self._create_plugin_directories()
     
     # ============================================================
@@ -203,7 +295,6 @@ class PluginLoader:
                     'message': result.get('message', ''),
                 }
                 
-                # استخراج کلید عمومی از لایسنس (اگر داشته باشه)
                 data = result.get('data', {})
                 if not self.public_key_pem and 'public_key' in data:
                     self.public_key_pem = data['public_key']
@@ -231,19 +322,19 @@ class PluginLoader:
         print("🔍 بارگذاری پلاگین‌ها")
         print("=" * 70)
         
-        # ===== ۱. پلاگین‌های رسمی =====
+        # پلاگین‌های رسمی
         official_dir = self.plugin_dir / "official_plugins"
         if official_dir.exists():
             print(f"\n📂 پوشه رسمی: {official_dir}")
             self._load_from_directory(official_dir, source="official")
         
-        # ===== ۲. پلاگین‌های شخص ثالث =====
+        # پلاگین‌های شخص ثالث
         third_party_dir = self.plugin_dir / "third_party"
         if third_party_dir.exists():
             print(f"\n📂 پوشه شخص ثالث: {third_party_dir}")
             self._load_from_directory(third_party_dir, source="third_party")
         
-        # ===== خلاصه =====
+        # خلاصه
         print("\n" + "=" * 70)
         print(f"✅ {len(self.plugins)} پلاگین بارگذاری شد")
         print("=" * 70)
@@ -282,20 +373,11 @@ class PluginLoader:
     # ============================================================
     
     def load_plugin(self, plugin_path: str, source: str = "unknown") -> bool:
-        """
-        بارگذاری فایل .plugin
-        
-        این تابع به صورت خودکار:
-        1. فرمت فایل رو تشخیص می‌ده (جدید/قدیم)
-        2. در صورت نیاز رمزگشایی می‌کنه
-        3. امضا رو بررسی می‌کنه
-        4. کد رو اجرا می‌کنه
-        """
+        """بارگذاری فایل .plugin"""
         plugin_path = Path(plugin_path)
         print(f"\n   📄 بارگذاری .plugin: {plugin_path.name}")
         
         try:
-            # ===== ۱. خواندن فایل =====
             with open(plugin_path, 'rb') as f:
                 plugin_data = f.read()
             
@@ -303,9 +385,7 @@ class PluginLoader:
                 print(f"   ❌ فایل خیلی کوچک است")
                 return False
             
-            # ============================================================
-            # ===== ۲. تشخیص فرمت =====
-            # ============================================================
+            # تشخیص فرمت
             is_new_format = (
                 LICENSE_CORE_AVAILABLE and
                 self.license_core and
@@ -313,10 +393,8 @@ class PluginLoader:
             )
             
             if is_new_format:
-                # ===== فرمت جدید: رمزنگاری‌شده =====
                 return self._load_encrypted_plugin(plugin_path, plugin_data, source)
             else:
-                # ===== فرمت قدیم: بدون رمزنگاری =====
                 return self._load_legacy_plugin(plugin_path, plugin_data, source)
         
         except Exception as e:
@@ -324,10 +402,6 @@ class PluginLoader:
             import traceback
             traceback.print_exc()
             return False
-    
-    # ============================================================
-    # ========== بارگذاری پلاگین رمزنگاری‌شده (جدید) ==========
-    # ============================================================
     
     def _load_encrypted_plugin(
         self,
@@ -337,12 +411,10 @@ class PluginLoader:
     ) -> bool:
         """بارگذاری پلاگین رمزنگاری‌شده"""
         
-        # ===== ۱. بررسی LicenseCore =====
         if not self.license_core:
             print(f"   ❌ LicenseCore در دسترس نیست!")
             return False
         
-        # ===== ۲. خواندن Header (بدون رمزگشایی) =====
         header = LicenseCore.read_plugin_header(plugin_data)
         
         if not header:
@@ -356,12 +428,11 @@ class PluginLoader:
         print(f"   📦 پلاگین: {plugin_name} (v{header.get('version', '?')})")
         print(f"   🏷️ نوع: {plugin_type}")
         
-        # ===== ۳. بررسی تکراری نبودن =====
         if plugin_id in self.plugins:
             print(f"   ⚠️ پلاگین {plugin_id} قبلاً بارگذاری شده")
             return False
         
-        # ===== ۴. بررسی ماژول‌های موردنیاز =====
+        # بررسی ماژول‌های موردنیاز
         required_modules = header.get('required_modules', [])
         if required_modules:
             print(f"   🔐 ماژول‌های موردنیاز: {required_modules}")
@@ -373,7 +444,7 @@ class PluginLoader:
             
             print(f"   ✅ همه ماژول‌ها مجاز هستند")
         
-        # ===== ۵. دریافت اطلاعات لایسنس =====
+        # اطلاعات لایسنس برای رمزگشایی
         license_data = self._get_license_data_for_decryption()
         
         if not license_data:
@@ -383,9 +454,6 @@ class PluginLoader:
             )
             return False
         
-        # ============================================================
-        # ===== ۶. رمزگشایی پلاگین ← قلب سیستم! =====
-        # ============================================================
         print(f"   🔓 رمزگشایی پلاگین...")
         
         try:
@@ -406,7 +474,6 @@ class PluginLoader:
         
         print(f"   ✅ رمزگشایی موفق ({len(code):,} کاراکتر کد)")
         
-        # ===== ۷. اجرای کد =====
         return self._execute_plugin_code(
             plugin_id=plugin_id,
             code=code,
@@ -414,21 +481,16 @@ class PluginLoader:
             source=source
         )
     
-    # ============================================================
-    # ========== بارگذاری پلاگین قدیمی ==========
-    # ============================================================
-    
     def _load_legacy_plugin(
         self,
         plugin_path: Path,
         plugin_data: bytes,
         source: str
     ) -> bool:
-        """بارگذاری پلاگین قدیمی (بدون رمزنگاری)"""
+        """بارگذاری پلاگین قدیمی"""
         print(f"   ℹ️ فرمت قدیمی (بدون رمزنگاری)")
         
         try:
-            # فرمت قدیم: manifest_len + manifest + sig_len + signature + code
             manifest_len = int.from_bytes(plugin_data[:4], 'big')
             manifest_bytes = plugin_data[4:4+manifest_len]
             manifest = json.loads(manifest_bytes.decode('utf-8'))
@@ -446,7 +508,7 @@ class PluginLoader:
                 print(f"   ⚠️ پلاگین {plugin_id} قبلاً بارگذاری شده")
                 return False
             
-            # ===== بررسی امضا =====
+            # بررسی امضا
             if self.public_key_pem and self.signer:
                 try:
                     code_str = code.decode('utf-8', errors='ignore')
@@ -471,7 +533,6 @@ class PluginLoader:
             else:
                 print(f"   ⚠️ بدون بررسی امضا")
             
-            # ===== اجرای کد =====
             code_str = code.decode('utf-8', errors='ignore')
             
             return self._execute_plugin_code(
@@ -497,7 +558,6 @@ class PluginLoader:
         print(f"\n   📄 بارگذاری .py: {plugin_path.name}")
         
         try:
-            # ===== بارگذاری ماژول =====
             spec = importlib.util.spec_from_file_location(
                 plugin_path.stem,
                 str(plugin_path)
@@ -512,7 +572,6 @@ class PluginLoader:
                 print(f"   ⚠️ پلاگین {plugin_id} قبلاً بارگذاری شده")
                 return False
             
-            # ===== بررسی ماژول‌های موردنیاز =====
             required_modules = getattr(module, 'REQUIRED_MODULES', [])
             if required_modules:
                 valid, msg = self._check_required_modules(required_modules)
@@ -520,10 +579,8 @@ class PluginLoader:
                     print(f"   🔒 {msg}")
                     return False
             
-            # ===== ساخت Plugin =====
             plugin = self._create_plugin(module, plugin_id)
             
-            # ذخیره metadata
             plugin.metadata = {
                 'source': source,
                 'type': getattr(module, 'PLUGIN_TYPE', 'internal'),
@@ -554,7 +611,6 @@ class PluginLoader:
     ) -> bool:
         """اجرای کد پلاگین بعد از رمزگشایی"""
         try:
-            # ===== ساخت ماژول =====
             spec = importlib.util.spec_from_loader(
                 plugin_id,
                 loader=None,
@@ -563,13 +619,10 @@ class PluginLoader:
             module = importlib.util.module_from_spec(spec)
             sys.modules[plugin_id] = module
             
-            # ===== اجرا =====
             exec(code, module.__dict__)
             
-            # ===== ساخت Plugin =====
             plugin = self._create_plugin(module, plugin_id)
             
-            # ذخیره manifest
             plugin.metadata = manifest.copy()
             plugin.metadata['source'] = source
             
@@ -608,7 +661,6 @@ class PluginLoader:
         if not required_modules:
             return True, "✅ نیازی به ماژول خاصی نیست"
         
-        # ===== دریافت ماژول‌های لایسنس =====
         license_modules = []
         
         if self.license_info:
@@ -621,7 +673,6 @@ class PluginLoader:
                 "   لطفاً مطمئن شوید لایسنس معتبری نصب کرده‌اید."
             )
         
-        # ===== بررسی =====
         missing = [m for m in required_modules if m not in license_modules]
         
         if missing:
@@ -634,17 +685,12 @@ class PluginLoader:
         return True, "✅ همه ماژول‌ها مجاز"
     
     def _get_license_data_for_decryption(self) -> Optional[Dict]:
-        """
-        دریافت اطلاعات لایسنس برای رمزگشایی
-        شامل: machine_id, license_id, plugin_aes_key
-        """
-        # ===== از license_info =====
+        """دریافت اطلاعات لایسنس برای رمزگشایی"""
         if self.license_info:
             data = self.license_info.get('data', {})
             if data.get('machine_id') and data.get('license_id'):
                 return data
         
-        # ===== تلاش برای بارگذاری =====
         if self.license_core:
             license_key = self.license_key or self.license_core.load_license()
             
@@ -665,11 +711,165 @@ class PluginLoader:
         return None
     
     # ============================================================
+    # ========== ✅ NEW: API های MenuRegistry ==========
+    # ============================================================
+    
+    def get_plugin_menu_structure(self) -> Dict:
+        """
+        دریافت ساختار کامل منو از همه پلاگین‌ها
+        
+        Returns:
+            {
+                'groups': [
+                    {
+                        'key': 'moadian',
+                        'text': 'مودیان',
+                        'icon': '🏛️',
+                        'order': 80,
+                        'module': 'moadian',
+                        'plugin_id': 'moadian',
+                    },
+                    ...
+                ],
+                'items': [
+                    {
+                        'key': 'plugin_moadian_invoice',
+                        'text': 'صورتحساب مودیان',
+                        'icon': '🏛️',
+                        'group': 'accounting',        # یا None
+                        'order': 100,
+                        'module': 'accounting',
+                        'widget_key': 'accounting',   # یا None
+                        'tab_index': 5,               # یا None
+                        'plugin_id': 'moadian',
+                        'widget_id': 'moadian_invoice',
+                    },
+                    ...
+                ]
+            }
+        """
+        structure = {
+            'groups': [],
+            'items': [],
+        }
+        
+        for plugin_id, plugin in self.plugins.items():
+            # ═══════════════════════════════════════════════════
+            # ۱. تب‌ها → items
+            # ═══════════════════════════════════════════════════
+            if plugin.has_event(PluginEvent.ON_TAB):
+                tabs = plugin.get_tabs()
+                for tab in tabs:
+                    # ساخت key یونیک
+                    widget_id = tab.get('widget_id') or 'main'
+                    item_key = f"plugin_{plugin_id}_{widget_id}"
+                    
+                    item = {
+                        'key': item_key,
+                        'text': tab['title'],
+                        'icon': tab.get('icon', '📄'),
+                        'group': tab.get('target_group'),
+                        'order': tab.get('order', 100),
+                        'module': tab.get('module', plugin_id),
+                        'widget_key': tab.get('widget_key'),
+                        'tab_index': tab.get('tab_index'),
+                        'plugin_id': plugin_id,
+                        'widget_id': widget_id,
+                        'source': 'plugin',
+                    }
+                    
+                    structure['items'].append(item)
+            
+            # ═══════════════════════════════════════════════════
+            # ۲. منوها → groups (اگه target_group ندارن)
+            # ═══════════════════════════════════════════════════
+            if plugin.has_event(PluginEvent.ON_MENU):
+                menus = plugin.get_menus()
+                for menu in menus:
+                    # اگه target_group داره، آیتم میشه
+                    if menu.get('target_group'):
+                        item_key = f"plugin_menu_{plugin_id}"
+                        
+                        item = {
+                            'key': item_key,
+                            'text': menu.get('title', plugin.name),
+                            'icon': menu.get('icon', '🔌'),
+                            'group': menu['target_group'],
+                            'order': menu.get('order', 100),
+                            'module': menu.get('module', plugin_id),
+                            'widget_key': item_key,
+                            'tab_index': None,
+                            'plugin_id': plugin_id,
+                            'widget_id': None,
+                            'source': 'plugin',
+                        }
+                        
+                        structure['items'].append(item)
+                    
+                    # اگه target_group نداره، گروه جدا
+                    else:
+                        group_key = f"plugin_group_{plugin_id}"
+                        
+                        group = {
+                            'key': group_key,
+                            'text': menu.get('title', plugin.name),
+                            'icon': menu.get('icon', '🔌'),
+                            'order': menu.get('order', 80),
+                            'module': menu.get('module', plugin_id),
+                            'plugin_id': plugin_id,
+                        }
+                        
+                        structure['groups'].append(group)
+                        
+                        # آیتم‌های این گروه
+                        for action in menu.get('actions', []):
+                            action_id = action.get('id', 'default')
+                            item_key = f"plugin_{plugin_id}_{action_id}"
+                            
+                            item = {
+                                'key': item_key,
+                                'text': action.get('title', action_id),
+                                'icon': action.get('icon', '🔌'),
+                                'group': group_key,
+                                'order': action.get('order', 100),
+                                'module': menu.get('module', plugin_id),
+                                'widget_key': item_key,
+                                'tab_index': None,
+                                'plugin_id': plugin_id,
+                                'widget_id': action_id,
+                                'source': 'plugin',
+                            }
+                            
+                            structure['items'].append(item)
+        
+        return structure
+    
+    # ============================================================
     # ========== API های عمومی ==========
     # ============================================================
     
     def get_plugin_tabs(self) -> List[Dict]:
-        """دریافت لیست تب‌های همه پلاگین‌ها"""
+        """
+        ✅ لیست تب‌ها با ساختار کامل
+        
+        Returns:
+            [
+                {
+                    'title': 'صورتحساب مودیان',
+                    'icon': '🏛️',
+                    'widget_id': 'moadian_invoice',
+                    'widget': 'moadian_invoice',       # سازگاری v4.0
+                    'target_group': 'accounting',       # ← جدید
+                    'order': 100,                       # ← جدید
+                    'widget_key': 'accounting',         # ← جدید
+                    'tab_index': 5,                     # ← جدید
+                    'module': 'accounting',
+                    'plugin_id': 'moadian',
+                    'metadata': {},
+                },
+                ...
+            ]
+        """
         print("\n🔍 دریافت تب‌های پلاگین...")
         tabs = []
         
@@ -679,18 +879,10 @@ class PluginLoader:
                     plugin_tabs = plugin.get_tabs()
                     if plugin_tabs:
                         for tab in plugin_tabs:
-                            tab['plugin_id'] = plugin_id
-                            
-                            # تعیین widget_id
-                            if 'widget' in tab:
-                                tab['widget_id'] = tab['widget']
-                            elif 'widget_id' in tab:
-                                tab['widget_id'] = tab['widget_id']
-                            else:
-                                tab['widget_id'] = None
-                            
                             tabs.append(tab)
-                            print(f"   ✅ تب از {plugin_id}: {tab.get('title', 'بدون عنوان')}")
+                            print(f"   ✅ تب از {plugin_id}: {tab.get('title', '?')}")
+                            if tab.get('target_group'):
+                                print(f"      → گروه: {tab['target_group']}")
                 except Exception as e:
                     print(f"   ❌ {plugin_id}: خطا در دریافت تب: {e}")
         
@@ -698,7 +890,7 @@ class PluginLoader:
         return tabs
     
     def get_plugin_menus(self) -> List[Dict]:
-        """دریافت لیست منوهای همه پلاگین‌ها"""
+        """دریافت لیست منوهای همه پلاگین‌ها (برای MenuBar)"""
         print("\n🔍 دریافت منوهای پلاگین...")
         menus = []
         
@@ -708,11 +900,12 @@ class PluginLoader:
                     plugin_menus = plugin.get_menus()
                     if plugin_menus:
                         for menu in plugin_menus:
+                            # فقط منوهایی که target_group ندارن
+                            # (این‌ها توی MenuBar میان)
                             menu['plugin_id'] = plugin_id
                             menus.append(menu)
-                            print(f"   ✅ منو از {plugin_id}: {menu.get('title', 'بدون عنوان')}")
                 except Exception as e:
-                    print(f"   ❌ {plugin_id}: خطا در دریافت منو: {e}")
+                    print(f"   ❌ {plugin_id}: خطا: {e}")
         
         print(f"   📊 تعداد کل: {len(menus)}")
         return menus
@@ -769,24 +962,18 @@ class PluginLoader:
     # ============================================================
     
     def install_plugin(self, source_path: str) -> bool:
-        """
-        نصب پلاگین از یک فایل
-        
-        فایل به پوشه third_party کپی می‌شه
-        """
+        """نصب پلاگین از یک فایل"""
         source_path = Path(source_path)
         
         if not source_path.exists():
             print(f"❌ فایل وجود ندارد: {source_path}")
             return False
         
-        # ===== تعیین پوشه مقصد =====
         dest_dir = self.plugin_dir / "third_party"
         dest_dir.mkdir(parents=True, exist_ok=True)
         
         dest = dest_dir / source_path.name
         
-        # ===== نام تکراری =====
         counter = 1
         while dest.exists():
             stem = source_path.stem
@@ -794,11 +981,9 @@ class PluginLoader:
             dest = dest_dir / f"{stem}_{counter}{suffix}"
             counter += 1
         
-        # ===== کپی =====
         shutil.copy2(source_path, dest)
         print(f"📂 فایل کپی شد به: {dest}")
         
-        # ===== بارگذاری =====
         if source_path.suffix == '.plugin':
             return self.load_plugin(str(dest), source="installed")
         elif source_path.suffix == '.py':
@@ -807,34 +992,31 @@ class PluginLoader:
         return False
     
     def uninstall_plugin(self, plugin_id: str) -> bool:
-        """
-        حذف کامل پلاگین از حافظه و دیسک
-        """
+        """حذف کامل پلاگین"""
         print(f"\n🗑️ حذف پلاگین: {plugin_id}")
         print("-" * 50)
         
         success = False
         plugin_file_path = None
         
-        # ===== ۱. جستجو در پوشه‌ها =====
         search_dirs = [
             self.plugin_dir / "third_party",
             self.plugin_dir / "official_plugins",
         ]
         
+        # جستجو
         for search_dir in search_dirs:
             if not search_dir.exists():
                 continue
             
-            # فایل‌های .plugin
+            # .plugin files
             for file_path in search_dir.glob("*.plugin"):
                 try:
                     with open(file_path, 'rb') as f:
-                        data = f.read(200)  # فقط 200 بایت اول
+                        data = f.read(200)
                     
                     header = LicenseCore.read_plugin_header(data)
                     if not header:
-                        # فرمت قدیم
                         try:
                             with open(file_path, 'r', encoding='utf-8') as f:
                                 data = json.load(f)
@@ -848,12 +1030,12 @@ class PluginLoader:
                         print(f"   📁 پیدا شد: {file_path.name}")
                         break
                 except Exception as e:
-                    print(f"   ⚠️ خطا در خواندن {file_path.name}: {e}")
+                    print(f"   ⚠️ خطا: {e}")
             
             if plugin_file_path:
                 break
             
-            # فایل‌های .py
+            # .py files
             if not plugin_file_path:
                 for file_path in search_dir.glob(f"*.py"):
                     if file_path.stem == plugin_id:
@@ -861,7 +1043,7 @@ class PluginLoader:
                         print(f"   📁 پیدا شد: {file_path.name}")
                         break
         
-        # ===== ۲. حذف از حافظه =====
+        # حذف از حافظه
         if plugin_id in self.plugins:
             try:
                 plugin = self.plugins[plugin_id]
@@ -871,50 +1053,45 @@ class PluginLoader:
             except Exception as e:
                 print(f"   ⚠️ خطا: {e}")
         
-        # ===== ۳. حذف از sys.modules =====
+        # حذف از sys.modules
         if plugin_id in sys.modules:
             try:
                 del sys.modules[plugin_id]
-                print(f"   ✅ از sys.modules حذف شد")
-            except Exception as e:
-                print(f"   ⚠️ خطا: {e}")
+            except Exception:
+                pass
         
-        # ===== ۴. حذف فایل =====
+        # حذف فایل
         if plugin_file_path and plugin_file_path.exists():
             try:
                 os.remove(plugin_file_path)
-                print(f"   ✅ فایل {plugin_file_path.name} حذف شد")
+                print(f"   ✅ فایل حذف شد")
                 success = True
             except PermissionError:
                 print(f"   ❌ فایل در حال استفاده است!")
                 return False
             except Exception as e:
-                print(f"   ❌ خطا در حذف: {e}")
+                print(f"   ❌ خطا: {e}")
                 return False
         else:
-            print(f"   ⚠️ فایل پیدا نشد (شاید قبلاً حذف شده)")
             success = True
         
-        # ===== ۵. حذف کش =====
+        # حذف کش
         for search_dir in search_dirs:
             cache_dir = search_dir / "__pycache__"
             if cache_dir.exists():
                 for cache_file in cache_dir.glob(f"{plugin_id}*.pyc"):
                     try:
                         os.remove(cache_file)
-                        print(f"   ✅ کش حذف شد: {cache_file.name}")
                     except:
                         pass
         
         print("-" * 50)
-        print(f"✅ پلاگین {plugin_id} حذف شد")
         return success
     
     def reload_plugins(self):
-        """بارگذاری مجدد همه پلاگین‌ها"""
+        """بارگذاری مجدد"""
         print("\n🔄 بارگذاری مجدد...")
         
-        # Cleanup
         for plugin_id, plugin in self.plugins.items():
             try:
                 plugin.fire(PluginEvent.ON_CLEANUP)
@@ -930,11 +1107,7 @@ class PluginLoader:
 # ============================================================
 
 class PluginManager:
-    """
-    مدیریت Singleton پلاگین‌ها
-    
-    برای دسترسی سراسری از همه جا
-    """
+    """مدیریت Singleton پلاگین‌ها"""
     _instance = None
     
     def __new__(
@@ -952,7 +1125,6 @@ class PluginManager:
             )
             cls._instance.loader.load_all_plugins()
         else:
-            # بروزرسانی لایسنس
             updated = False
             
             if license_info:
@@ -977,7 +1149,12 @@ class PluginManager:
         return self.loader.get_all_plugins_info()
     
     def get_plugin_tabs(self) -> List[Dict]:
+        """✅ لیست تب‌ها با ساختار کامل"""
         return self.loader.get_plugin_tabs()
+    
+    def get_plugin_menu_structure(self) -> Dict:
+        """✅ NEW: ساختار کامل منو"""
+        return self.loader.get_plugin_menu_structure()
     
     def get_plugin_widget(self, plugin_id: str, widget_id: str):
         return self.loader.get_plugin_widget(plugin_id, widget_id)
