@@ -14,7 +14,7 @@ def get_base_path():
 
 def get_data_path():
     """دریافت مسیر ذخیره دیتابیس و تنظیمات (در AppData)"""
-    app_data = Path(os.environ.get('APPDATA', os.path.expanduser('~'))) / "ParsehAccounting"
+    app_data = Path(os.environ.get('APPDATA', os.path.expanduser('~'))) / "ImanAccounting"
     app_data.mkdir(parents=True, exist_ok=True)
     return str(app_data)
 
